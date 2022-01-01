@@ -1,8 +1,24 @@
+#![feature(portable_simd)]
 #![allow(dead_code)]
 #![allow(clippy::missing_safety_doc)]
+
 use crossbeam_epoch::{self as epoch, Atomic, Guard, Shared};
-use std::mem::{self, MaybeUninit};
+use epoch::{CompareAndSetError, Owned};
+use std::borrow::{Borrow, BorrowMut};
+use std::collections::hash_map::RandomState;
+use std::hash::Hasher;
+use std::ops::{BitXor, Deref};
+use std::simd::Simd;
 use std::sync::atomic::Ordering::{Relaxed, SeqCst};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::{
+    hash::{BuildHasher, Hash},
+    mem::{self},
+};
+
+const DIMENSION: usize = 16;
+const BASIS: usize = 16;
+const NULL: Atomic<()> = Atomic::null();
 
 #[inline]
 fn set_adpinv(p: usize) -> usize {
@@ -45,29 +61,6 @@ pub enum LocatePredStatus {
     LogicallyRemoved,
 }
 
-const DIMENSION: usize = 16;
-const MASK: [usize; DIMENSION] = [
-    0x3 << 30,
-    0x3 << 28,
-    0x3 << 26,
-    0x3 << 24,
-    0x3 << 22,
-    0x3 << 20,
-    0x3 << 18,
-    0x3 << 16,
-    0x3 << 14,
-    0x3 << 12,
-    0x3 << 10,
-    0x3 << 8,
-    0x3 << 6,
-    0x3 << 4,
-    0x3 << 2,
-    0x3,
-];
-
-/// An entry in the adjacency list.
-/// It is guaranteed to live as long as the Guard
-/// that is used to get the entry.
 pub struct Entry<'t, 'g, T> {
     pub node: &'g MdNode<T>,
     _parent: &'t Inner<T>,
@@ -75,7 +68,7 @@ pub struct Entry<'t, 'g, T> {
 }
 
 impl<'t, 'g, T> Entry<'t, 'g, T> {
-    fn coord(&self) -> [usize; DIMENSION] {
+    fn coord(&self) -> [u8; DIMENSION] {
         self.node.coord
     }
 }
@@ -84,7 +77,7 @@ impl<'t, 'g, T> std::ops::Deref for Entry<'t, 'g, T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
-        unsafe { self.node.val.assume_init_ref() }
+        self.node.val.as_ref().unwrap()
     }
 }
 
@@ -144,7 +137,6 @@ impl<'t: 'g, 'g, T: 't> Iterator for Iter<'t, 'g, T> {
     }
 }
 
-#[repr(C)]
 #[derive(Debug)]
 pub struct MdDesc<T> {
     dim: usize,
@@ -152,38 +144,23 @@ pub struct MdDesc<T> {
     curr: Atomic<MdNode<T>>,
 }
 
-// I don't think we should activate this,
-// curr should be freed elsewhere
-// impl<T: std::fmt::Debug> std::ops::Drop for MdDesc<T> {
-//     fn drop(&mut self) {
-//         unsafe {
-//             if !self.curr.load(Relaxed, epoch::unprotected()).is_null() {
-//                 drop(mem::replace(&mut self.curr, Atomic::null()).into_owned());
-//             }
-//         }
-//     }
-// }
-
-/// A node in the `MDList`
-/// Marked `repr(C)` to improve cache locality
-#[repr(C)]
 pub struct MdNode<T> {
-    coord: [usize; DIMENSION],
-    val: MaybeUninit<T>,
+    coord: [u8; DIMENSION],
+    val: Option<T>,
     pending: Atomic<MdDesc<T>>,
     children: [Atomic<Self>; DIMENSION],
 }
 
 impl<T> Default for MdNode<T> {
     fn default() -> Self {
-        Self::new_uninit(0)
+        Self::new_uninit(0, 0)
     }
 }
 
 impl<T: std::fmt::Debug> std::fmt::Debug for MdNode<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         unsafe {
-            let guard = &*(&epoch::pin() as *const _);
+            let guard = &&epoch::pin();
 
             f.debug_struct("MdNode")
                 .field(
@@ -194,7 +171,7 @@ impl<T: std::fmt::Debug> std::fmt::Debug for MdNode<T> {
                         .map(ToString::to_string)
                         .collect::<String>(),
                 )
-                .field("val", self.val.assume_init_ref())
+                .field("val", &self.val)
                 .field("pending", &self.pending.load(Relaxed, guard).as_ref())
                 .field(
                     "children",
@@ -212,15 +189,12 @@ impl<T: std::fmt::Debug> std::fmt::Debug for MdNode<T> {
 impl<T> std::ops::Drop for MdNode<T> {
     fn drop(&mut self) {
         unsafe {
-            if self.coord != [0; 16] {
-                std::ptr::drop_in_place(self.val.as_mut_ptr());
-            }
             if !self.pending.load(Relaxed, epoch::unprotected()).is_null() {
                 drop(mem::replace(&mut self.pending, Atomic::null()).into_owned());
             }
 
-            let children = mem::take(&mut self.children);
-            for child in children {
+            let children = mem::replace(&mut self.children, Self::NULL_CHILDREN);
+            for child in children.into_iter() {
                 let child_ref = child.load(Relaxed, epoch::unprotected());
                 if !child_ref.is_null() && !is_invalid(child_ref.tag()) {
                     drop(child.into_owned());
@@ -231,35 +205,36 @@ impl<T> std::ops::Drop for MdNode<T> {
 }
 
 impl<T> MdNode<T> {
-    pub fn new(key: usize, val: T) -> Self {
+    const NULL_CHILDREN: [Atomic<Self>; DIMENSION] =
+        unsafe { std::mem::transmute([NULL; DIMENSION]) };
+    pub fn new(key: usize, val: T, dim: usize) -> Self {
         Self {
-            val: MaybeUninit::new(val),
+            val: Some(val),
             coord: Inner::<T>::key_to_coord(key),
             pending: Atomic::null(),
-            children: Default::default(),
+            children: Self::NULL_CHILDREN,
         }
     }
 
-    pub fn new_uninit(key: usize) -> Self {
+    pub fn new_uninit(key: usize, dim: usize) -> Self {
         Self {
-            val: MaybeUninit::uninit(),
+            val: None,
             coord: Inner::<T>::key_to_coord(key),
             pending: Atomic::null(),
-            children: Default::default(),
+            children: Self::NULL_CHILDREN,
         }
     }
 
-    pub fn with_coord(coord: [usize; DIMENSION], val: T) -> Self {
+    pub fn with_coord(coord: [u8; DIMENSION], val: T, dim: usize) -> Self {
         Self {
-            val: MaybeUninit::new(val),
+            val: Some(val),
             coord,
             pending: Atomic::null(),
-            children: Default::default(),
+            children: Self::NULL_CHILDREN,
         }
     }
 }
 
-#[repr(C)]
 #[derive(Default)]
 pub struct Inner<T> {
     head: Atomic<MdNode<T>>,
@@ -271,7 +246,7 @@ impl<T: std::fmt::Debug> std::fmt::Debug for Inner<T> {
             let guard = &epoch::pin();
 
             f.debug_struct("MdList")
-                .field("head", &self.head.load(SeqCst, guard).as_ref().unwrap())
+                .field("head", &self.head.load(Relaxed, guard).as_ref().unwrap())
                 .finish()
         }
     }
@@ -286,11 +261,11 @@ impl<T> std::ops::Drop for Inner<T> {
                 drop(mem::replace(&mut head.pending, Atomic::null()).into_owned());
             }
 
-            let children = mem::take(&mut head.children);
+            let children = mem::replace(&mut head.children, MdNode::<T>::NULL_CHILDREN);
 
             drop(mem::replace(&mut self.head, Atomic::null()).into_owned());
 
-            for child in children {
+            for child in children.into_iter() {
                 let child_ref = child.load(Relaxed, epoch::unprotected());
                 if !child_ref.is_null() {
                     drop(child.into_owned());
@@ -309,9 +284,8 @@ pub enum InsertStatus {
 
 impl<'g, T> Inner<T> {
     pub fn new() -> Self {
-        Self {
-            head: Atomic::new(MdNode::new_uninit(0)),
-        }
+        let head = Atomic::new(MdNode::new_uninit(0, 0));
+        Self { head }
     }
 
     pub fn iter<'t>(&'t self, guard: &'g Guard) -> Iter<'t, 'g, T> {
@@ -328,127 +302,142 @@ impl<'g, T> Inner<T> {
         &self.head
     }
 
-    pub unsafe fn pop_front(&self, guard: &Guard) -> Option<T> {
-        let mut stack = vec![&self.head];
-
-        while let Some(next) = stack.pop() {
-            let mut next = next.load(SeqCst, guard);
-            if let Some(next_ref) = next.as_ref() {
-                for d in 0..DIMENSION {
-                    let child = &next_ref.children[d];
-                    let mut loaded_child = child.load(SeqCst, guard);
-                    if !loaded_child.is_null() && !is_delinv(loaded_child.tag()) {
-                        return Self::remove(&mut next, &mut loaded_child, d, DIMENSION, guard);
-                    }
-                    stack.push(child);
-                }
-            }
-        }
-
-        None
-    }
-    pub unsafe fn get(
-        &self,
-        key: usize,
-        guard: &Guard,
-    ) -> Result<Entry<'_, 'g, T>, impl std::fmt::Debug> {
+    pub unsafe fn get(&self, key: usize, guard: &Guard) -> Option<Entry<'_, 'g, T>> {
         // Rebind lifetime to self
         let guard = &*(guard as *const _);
 
         let coord = Self::key_to_coord(key);
         let pred = &mut Shared::null();
-        let curr = &mut self.head.load(SeqCst, guard);
+        let ad = &mut Shared::null();
+        let curr = &mut self.head.load(Relaxed, guard);
         let mut dim = 0;
         let mut pred_dim = 0;
-        if let LocatePredStatus::Found =
-            Self::locate_pred(&coord, pred, curr, &mut dim, &mut pred_dim, guard)
-        {
-            if dim == DIMENSION {
-                if let Some(curr_ref) = curr.as_ref() {
-                    Ok(Entry {
-                        node: curr_ref,
-                        _parent: self,
-                        _guard: guard,
-                    })
-                } else {
-                    Err("Node was found, but it was NULL")
-                }
-            } else {
-                Err("Node not found")
+        Self::locate_pred(&coord, ad, pred, curr, &mut dim, &mut pred_dim, guard);
+        if dim == DIMENSION {
+            let curr_ref = curr.as_ref()?;
+            if curr_ref.val.is_none() {
+                return None;
             }
-        } else {
-            Err("Node was found, but was logically removed")
+
+            return Some(Entry {
+                node: curr_ref,
+                _parent: self,
+                _guard: guard,
+            });
+        }
+
+        None
+    }
+
+    pub unsafe fn delete(&self, key: usize) -> Option<T> {
+        let guard = &epoch::pin();
+        let coord = Inner::<T>::key_to_coord(key);
+        loop {
+            let dim = &mut 0;
+            let pred_dim = &mut 0;
+            let ad = &mut Shared::null();
+            let curr = &mut self.head.load(Relaxed, guard);
+            let pred: &mut Shared<'_, MdNode<T>> = &mut Shared::null();
+            Self::locate_pred(&coord, ad, pred, curr, dim, pred_dim, guard);
+
+            if *dim != DIMENSION {
+                // Could not find node to delete
+                return None;
+            }
+
+            let marked = curr.with_tag(set_delinv(curr.tag()));
+            if let Some(pred_ref) = pred.as_ref() {
+                let child = pred_ref
+                    .children
+                    .get_unchecked(*pred_dim)
+                    .load(SeqCst, guard);
+                // makr node for deletion
+                let new_child = match pred_ref
+                    .children
+                    .get_unchecked(*pred_dim)
+                    .compare_and_set(*curr, marked, SeqCst, guard)
+                {
+                    Ok(new) => new,
+                    Err(CompareAndSetError { current, .. }) => current,
+                };
+
+                if child.with_tag(clr_invalid(child.tag())) == *curr {
+                    if !is_invalid(child.tag()) {
+                        let res = curr.deref_mut().val.take();
+                        return res;
+                    } else if is_delinv(child.tag()) {
+                        return None;
+                    }
+                }
+            }
         }
     }
 
-    pub unsafe fn insert<'a>(
-        &self,
-        new_node: &Atomic<MdNode<T>>,
-        pred: &mut Shared<'a, MdNode<T>>,
-        curr: &mut Shared<'a, MdNode<T>>,
-        dim: &mut usize,
-        pred_dim: &mut usize,
-        guard: &'a Guard,
-    ) -> InsertStatus {
-        let pred_ref = pred.as_ref().unwrap(); // Safe unwrap
-        let pred_child_atomic = &pred_ref.children[*pred_dim];
-        let pred_child = pred_child_atomic.load(SeqCst, guard);
+    #[inline(never)]
+    pub unsafe fn insert(&self, key: usize, val: T) -> InsertStatus {
+        let guard = &epoch::pin();
+        let coord = Inner::<T>::key_to_coord(key);
+        let mut new_node = Owned::new(MdNode::with_coord(coord, val, 0));
 
-        if *dim == DIMENSION && !is_delinv(pred_child.tag()) {
-            return InsertStatus::AlreadyExists;
-        }
+        loop {
+            let dim = &mut 0;
+            let pred_dim = &mut 0;
+            let curr = &mut self.head.load(Relaxed, guard);
+            let pred: &mut Shared<'_, MdNode<T>> = &mut Shared::null();
+            let ad: &mut Shared<'_, MdDesc<T>> = &mut Shared::null();
 
-        let expected = if is_delinv(pred_child.tag()) {
-            if *dim == DIMENSION - 1 {
-                *dim = DIMENSION;
+            Self::locate_pred(&coord, ad, pred, curr, dim, pred_dim, guard);
+
+            if *dim == DIMENSION {
+                return InsertStatus::AlreadyExists;
             }
-            curr.with_tag(set_delinv(curr.tag()))
-        } else {
-            *curr
-        };
 
-        if pred_child == expected {
-            let mut new_node = new_node.load(Relaxed, epoch::unprotected());
-            let new_node_val = new_node.deref_mut();
-            let desc = Self::fill_new_node(new_node_val, expected, dim, pred_dim, guard);
+            if *dim != *pred_dim {
+                if let Some(curr_ref) = curr.as_ref() {
+                    let pending = curr_ref.pending.load(SeqCst, guard);
+                    *ad = pending;
+                    if !pending.is_null() {
+                        Self::finish_inserting(curr_ref, pending, guard);
+                    }
+                }
+            }
 
-            if pred_ref.children[*pred_dim]
-                .compare_and_set(expected, new_node, SeqCst, guard)
-                .is_ok()
-            {
-                let desc = desc.load(SeqCst, guard);
-                if !desc.is_null() {
-                    if let Some(curr_ref) = curr.as_ref() {
-                        let pending = curr_ref.pending.load(SeqCst, guard);
-                        if !pending.is_null() {
-                            Self::finish_inserting(curr_ref, pending, guard);
+            if let Some(pred_ref) = pred.as_ref() {
+                let child = pred_ref
+                    .children
+                    .get_unchecked(*pred_dim)
+                    .load(Relaxed, guard);
+                if is_delinv(child.tag()) {
+                    *curr = curr.with_tag(set_delinv(curr.tag()));
+                    if *dim == DIMENSION - 1 {
+                        *dim = DIMENSION;
+                    }
+                }
+
+                let desc = Self::fill_new_node(new_node.borrow_mut(), *curr, dim, pred_dim, guard);
+
+                match pred_ref
+                    .children
+                    .get_unchecked(*pred_dim)
+                    .compare_and_set(*curr, new_node, SeqCst, guard)
+                {
+                    Ok(mut new_node) => {
+                        let desc = desc.load(Relaxed, guard);
+                        if !desc.is_null() {
+                            Self::finish_inserting(new_node.deref_mut(), desc, guard);
+                        }
+
+                        return InsertStatus::Inserted;
+                    }
+                    Err(err) => {
+                        new_node = err.new;
+                        if !desc.load(SeqCst, guard).is_null() {
+                            drop(desc.into_owned());
                         }
                     }
-
-                    Self::finish_inserting(&*new_node_val, desc, guard);
                 }
-                return InsertStatus::Inserted;
-            }
-            // drop(desc.into_owned());
-        }
-
-        if is_adpinv(pred_child.tag()) {
-            *pred = Shared::null();
-            *curr = self.head.load(SeqCst, guard);
-            *dim = 0;
-            *pred_dim = 0;
-        } else if pred_child.with_tag(0) != *curr {
-            *curr = *pred;
-            *dim = *pred_dim;
-        }
-
-        if let Some(new_node_ref) = new_node.load(SeqCst, guard).as_ref() {
-            if !new_node_ref.pending.load(SeqCst, guard).is_null() {
-                new_node_ref.pending.store(Shared::null(), SeqCst);
             }
         }
-
-        InsertStatus::Blocked
     }
 
     pub unsafe fn remove<'t>(
@@ -465,10 +454,7 @@ impl<'g, T> Inner<T> {
                     .compare_and_set(*curr, curr.with_tag(set_delinv(curr.tag())), SeqCst, guard)
                     .is_ok()
             {
-                return Some(
-                    std::mem::replace(&mut curr.deref_mut().val, MaybeUninit::uninit())
-                        .assume_init(),
-                );
+                return curr.deref_mut().val.take();
             }
         }
 
@@ -479,104 +465,103 @@ impl<'g, T> Inner<T> {
         // Rebind lifetime to self
         let coord = Self::key_to_coord(key);
         let pred = &mut Shared::null();
+        let ad = &mut Shared::null();
         let curr = &mut self.head.load(SeqCst, guard);
         let mut dim = 0;
         let mut pred_dim = 0;
 
-        Self::locate_pred(&coord, pred, curr, &mut dim, &mut pred_dim, guard);
+        Self::locate_pred(&coord, ad, pred, curr, &mut dim, &mut pred_dim, guard);
 
         dim == DIMENSION
     }
 
-    /// Computes the 16th root of a given key
-    #[inline]
-    fn key_to_coord(key: usize) -> [usize; DIMENSION] {
-        // let mut coords = [0; DIMENSION];
-        // for i in 0..DIMENSION {
-        //     coords[i] = (key & MASK[i]) >> (30 - (i << 1));
-        // }
-        // coords
+    // #[inline]
+    // fn key_to_coord(key: usize) -> [u8; DIMENSION] {
+    //     let v = key.to_le_bytes();
 
-        // The above code is 83 assebly instructions, this is 63.
-        // We mainly abvoid movups instructions
-        // Does it improve performance signficantly? ¯\_(ツ)_/¯, probably not
-        [
-            (key & MASK[0]) >> 30,
-            (key & MASK[1]) >> (30 - (1 << 1)),
-            (key & MASK[2]) >> (30 - (2 << 1)),
-            (key & MASK[3]) >> (30 - (3 << 1)),
-            (key & MASK[4]) >> (30 - (4 << 1)),
-            (key & MASK[5]) >> (30 - (5 << 1)),
-            (key & MASK[6]) >> (30 - (6 << 1)),
-            (key & MASK[7]) >> (30 - (7 << 1)),
-            (key & MASK[8]) >> (30 - (8 << 1)),
-            (key & MASK[9]) >> (30 - (9 << 1)),
-            (key & MASK[10]) >> (30 - (10 << 1)),
-            (key & MASK[11]) >> (30 - (11 << 1)),
-            (key & MASK[12]) >> (30 - (12 << 1)),
-            (key & MASK[13]) >> (30 - (13 << 1)),
-            (key & MASK[14]) >> (30 - (14 << 1)),
-            (key & MASK[15]),
-        ]
+    //     let q = Simd::from_array([
+    //         v[7], v[7], v[6], v[6], v[5], v[5], v[4], v[4], v[3], v[3], v[2], v[2], v[1], v[1],
+    //         v[0], v[0],
+    //     ]);
+    //     const MASK: Simd<u8, 16> = Simd::from_array([
+    //         0xF0, 0x0F, 0xF0, 0x0F, 0xF0, 0x0F, 0xF0, 0x0F, 0xF0, 0x0F, 0xF0, 0x0F, 0xF0, 0x0F,
+    //         0xF0, 0x0F,
+    //     ]);
+    //     (q & MASK).to_array()
+    // }
+
+    #[inline]
+    fn key_to_coord(key: usize) -> [u8; DIMENSION] {
+        let mut quotient = key;
+        let mut coord = [0u8; DIMENSION];
+
+        for d in (0..DIMENSION).rev() {
+            coord[d] = (quotient % BASIS) as u8;
+            quotient = quotient / BASIS;
+        }
+
+        coord
     }
 
-    #[inline]
+    #[inline(never)]
     unsafe fn locate_pred<'t>(
-        coord: &[usize; DIMENSION],
+        coord: &[u8; DIMENSION],
+        ad: &mut Shared<'_, MdDesc<T>>,
         pred: &mut Shared<'t, MdNode<T>>,
         curr: &mut Shared<'t, MdNode<T>>,
         dim: &mut usize,
         pred_dim: &mut usize,
         guard: &'t Guard,
-    ) -> LocatePredStatus {
-        let mut status = LocatePredStatus::Found;
-        // Locate the proper position to insert
-        // tranverses list from low dim to high dim
-        while *dim < DIMENSION {
-            // Locate predecessor and successor
-            while let Some(curr_ref) = curr.as_ref() {
-                if coord[*dim] > curr_ref.coord[*dim] {
-                    *pred_dim = *dim;
-                    *pred = *curr;
+    ) {
+        let guard = &*(guard as *const _);
+        let mut pd = *pred_dim;
+        let mut cd = *dim;
+        let mut pred_new = Shared::null();
 
-                    let pending = curr_ref.pending.load(SeqCst, guard);
-                    if let Some(pending_ref) = pending.as_ref() {
-                        if *dim >= pending_ref.pred_dim && *dim <= pending_ref.dim {
-                            Self::finish_inserting(curr_ref, pending, guard);
+        while cd < DIMENSION {
+            let coord_base = coord.get_unchecked(cd);
+            while let Some(curr_ref) = curr.as_ref() {
+                if coord_base > curr_ref.coord.get_unchecked(cd) {
+                    pd = cd;
+                    pred_new = *curr;
+
+                    *ad = curr_ref.pending.load(Relaxed, guard);
+                    if let Some(ad_ref) = ad.as_ref() {
+                        if (ad_ref.pred_dim..=ad_ref.dim).contains(&pd) {
+                            Self::finish_inserting(curr_ref, *ad, guard);
                         }
                     }
 
-                    let child = curr_ref.children[*dim].load(SeqCst, guard);
-                    if is_delinv(child.tag()) {
-                        status = LocatePredStatus::LogicallyRemoved;
-                    };
-                    *curr = child.with_tag(clr_invalid(child.tag()));
+                    let child = curr_ref
+                        .children
+                        .get_unchecked(cd)
+                        .load(Ordering::Acquire, guard);
+                    *curr = child;
+                    if curr.is_null() {
+                        break;
+                    }
                 } else {
                     break;
                 }
             }
 
-            // No successor has greater coord at this dimension
-            // The position after pred is the insertion position
-
-            match curr.as_ref() {
-                None => break,
-                Some(curr) if coord[*dim] < curr.coord[*dim] => {
-                    break;
-                }
-                _ => {
-                    // continue to search in the next dimension
-                    // if coord[dim] of new_node overlaps with that of curr node
-                    // dim only increases if two coords are exactly the same
-                    *dim += 1;
+            if let Some(curr) = curr.as_ref() {
+                if coord.get_unchecked(cd) >= curr.coord.get_unchecked(cd) {
+                    cd += 1;
+                    continue;
                 }
             }
+
+            break;
         }
 
-        status
+        *dim = cd;
+        *pred = pred_new;
+        *curr = curr.with_tag(0x0);
+        *pred_dim = pd;
     }
 
-    #[inline]
+    #[inline(never)]
     fn fill_new_node<'a>(
         new_node: &mut MdNode<T>,
         curr: Shared<'a, MdNode<T>>,
@@ -585,7 +570,6 @@ impl<'g, T> Inner<T> {
         guard: &Guard,
     ) -> Atomic<MdDesc<T>> {
         let desc = if *pred_dim != *dim {
-            // descriptor to instruct other insertion task to help migrate the children
             let curr_untagged = Atomic::null();
             curr_untagged.store(curr.with_tag(clr_delinv(curr.tag())), Relaxed);
             Atomic::new(MdDesc {
@@ -599,29 +583,25 @@ impl<'g, T> Inner<T> {
 
         for i in 0..*pred_dim {
             new_node.children[i].store(
-                // Shared::null().with_tag(0x1),
-                new_node.children[i].load(SeqCst, guard).with_tag(0x1),
-                SeqCst,
+                Shared::null().with_tag(0x1),
+                // new_node.children[i].load(Relaxed, guard).with_tag(0x1),
+                Relaxed,
             );
         }
 
         if *dim < DIMENSION {
-            // unsafe {
-            //     if !new_node.children[*dim].load(SeqCst, guard).is_null() {
-            //         mem::replace(&mut new_node.children[*dim], Atomic::null()).into_owned();
-            //     }
-            // }
-            new_node.children[*dim].store(curr, SeqCst);
+            unsafe {
+                new_node.children.get_unchecked(*dim).store(curr, Relaxed);
+            }
         }
 
-        new_node.pending.store(desc.load(SeqCst, guard), SeqCst);
+        new_node.pending.store(desc.load(Relaxed, guard), SeqCst);
 
         desc
     }
 
-    #[inline]
     pub unsafe fn finish_inserting(n: &MdNode<T>, desc: Shared<'_, MdDesc<T>>, guard: &Guard) {
-        let desc_ref = desc.as_ref().unwrap(); // Safe unwrap
+        let desc_ref = desc.deref(); // Safe unwrap
         let pred_dim = desc_ref.pred_dim;
         let dim = desc_ref.dim;
         let curr = &desc_ref.curr;
@@ -635,11 +615,10 @@ impl<'g, T> Inner<T> {
                 if n.children[i].load(Relaxed, guard).is_null() {
                     let _ = n.children[i].compare_and_set(Shared::null(), child, SeqCst, guard);
                 }
-            } else {
             }
         }
 
-        if n.pending.load(SeqCst, guard) == desc {
+        if n.pending.load(Relaxed, guard) == desc {
             if let Ok(p) = n
                 .pending
                 .compare_and_set(desc, Shared::null(), SeqCst, guard)
@@ -653,54 +632,72 @@ impl<'g, T> Inner<T> {
 }
 
 #[derive(Default, Debug)]
-pub struct MdMap<T> {
-    list: Inner<T>,
+pub struct MdMap<K, V, S = RandomState> {
+    list: Inner<V>,
+    hasher: S,
+    phantom_data: std::marker::PhantomData<K>,
 }
 
-impl<T> MdMap<T> {
+impl<K: Hash, T> MdMap<K, T> {
     pub fn new() -> Self {
-        Self { list: Inner::new() }
+        Self {
+            list: Inner::new(),
+            hasher: Default::default(),
+            phantom_data: std::marker::PhantomData,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct FakeHasher(u64);
+
+impl Hasher for FakeHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        if self.0 == 0 {
+            u64::MAX
+        } else {
+            self.0
+        }
     }
 
     #[inline]
-    pub fn insert(&self, key: usize, value: T) {
-        let coord = Inner::<T>::key_to_coord(key);
-        let new_node = Atomic::new(MdNode::with_coord(coord, value));
-        let dim = &mut 0;
-        let pred_dim = &mut 0;
-
-        unsafe {
-            let guard = &epoch::pin();
-
-            let md_current = &mut self.list.head().load(Relaxed, guard);
-            let md_pred: &mut Shared<'_, MdNode<T>> = &mut Shared::null();
-
-            let mut first = true;
-            loop {
-                Inner::<T>::locate_pred(&coord, md_pred, md_current, dim, pred_dim, guard);
-                if !first {
-                    if let Some(current) = md_current.as_ref() {
-                        if current.coord == coord {
-                            break;
-                        }
-                    }
-                } else {
-                    first = false;
-                }
-
-                match self
-                    .list
-                    .insert(&new_node, md_pred, md_current, dim, pred_dim, guard)
-                {
-                    InsertStatus::Inserted => break,
-                    InsertStatus::AlreadyExists => {
-                        drop(new_node.into_owned());
-                        break;
-                    }
-                    _ => {}
-                }
-            }
+    fn write(&mut self, bytes: &[u8]) {
+        if bytes.len() == 4 {
+            self.0 = u64::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3], 0, 0, 0, 0]);
+        } else {
+            self.0 = u64::from_le_bytes([
+                bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+            ]);
         }
+    }
+}
+
+#[derive(Default, Clone)]
+pub struct FakeHashBuilder;
+
+impl BuildHasher for FakeHashBuilder {
+    type Hasher = FakeHasher;
+
+    fn build_hasher(&self) -> Self::Hasher {
+        FakeHasher(0)
+    }
+}
+
+impl<K: Hash, T, S: BuildHasher> MdMap<K, T, S> {
+    pub fn with_hasher(hasher: S) -> Self {
+        Self {
+            list: Inner::new(),
+            hasher,
+            phantom_data: std::marker::PhantomData,
+        }
+    }
+
+    #[inline]
+    pub fn hash_usize<V: Hash>(&self, item: &V) -> usize {
+        let mut hasher = self.hasher.build_hasher();
+        item.hash(&mut hasher);
+        hasher.finish() as usize
     }
 
     pub fn iter(&'_ self) -> Iter<'_, '_, T> {
@@ -710,104 +707,77 @@ impl<T> MdMap<T> {
         }
     }
 
-    pub fn pop_front(&self) -> Option<T> {
+    pub fn insert(&self, key: K, value: T) -> InsertStatus {
+        let key = self.hash_usize(&key);
+        unsafe { self.list.insert(key, value) }
+    }
+
+    pub fn get<Q>(&self, key: &Q) -> Option<Entry<'_, '_, T>>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        let key = self.hash_usize(&key);
         unsafe {
-            let guard = &*(&epoch::pin() as *const _);
-            self.list.pop_front(guard)
+            let guard = &epoch::unprotected();
+            self.list.get(key, guard)
         }
     }
 
-    pub fn get(&self, key: usize) -> Option<Entry<'_, '_, T>> {
-        unsafe {
-            let guard = &*(&epoch::pin() as *const _);
-            self.list.get(key, guard).ok()
-        }
-    }
-
-    pub fn contains(&self, key: usize) -> bool {
+    pub fn contains<Q>(&self, key: &Q) -> bool
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        let key = self.hash_usize(&key);
         unsafe {
             let guard = &*(&epoch::pin() as *const _);
             self.list.contains(key, guard)
         }
     }
 
-    pub fn remove(&self, key: usize) -> Option<T> {
-        unsafe {
-            let dim = &mut 0;
-            let pred_dim = &mut 0;
-            let guard = &*(&epoch::pin() as *const _);
-
-            let md_current = &mut self.list.head().load(SeqCst, guard);
-            let md_pred: &mut Shared<'_, MdNode<T>> = &mut Shared::null();
-
-            let coord = Inner::<T>::key_to_coord(key);
-            Inner::<T>::locate_pred(&coord, md_pred, md_current, dim, pred_dim, guard);
-            Inner::<T>::remove(md_pred, md_current, *pred_dim, *dim, guard)
-        }
+    pub fn remove(&self, key: K) -> Option<T> {
+        let key = self.hash_usize(&key);
+        unsafe { self.list.delete(key) }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rayon::prelude::*;
 
     #[test]
     fn test_insert() {
         let list = MdMap::new();
-        list.insert(1, 10);
-        assert_eq!(*list.get(1).unwrap(), 10);
+        list.insert(0, 10);
+        assert_eq!(*list.get(&0).unwrap(), 10);
     }
 
     #[test]
     fn test_remove() {
         let list = MdMap::new();
         list.insert(1, 10);
-        assert_eq!(*list.get(1).unwrap(), 10);
+        assert_eq!(*list.get(&1).unwrap(), 10);
         assert_eq!(list.remove(1), Some(10));
-        assert!(list.get(1).is_none());
+        assert!(list.get(&1).is_none());
     }
-
-    // not supported for now
-    // #[test]
-    // fn test_update() {
-    //     let list = MdList::new();
-    //     list.insert(1, 10);
-    //     list.insert(1, 20);
-
-    //     assert_eq!(*list.get(1).unwrap(), 20);
-    // }
 
     #[test]
     fn test_multiple() {
         let list = MdMap::new();
-        for i in 1..100 {
+        for i in 0..100 {
             list.insert(i, i);
         }
+        dbg!(&list);
 
-        for i in 1..100 {
-            assert_eq!(*list.get(i).unwrap(), i);
+        for i in 0..100 {
+            assert_eq!(list.get(&i).map(|v| *v), Some(i), "key: {}", i);
         }
 
-        for i in 1..100 {
-            list.remove(i);
+        for i in 0..100 {
+            assert_eq!(list.remove(i), Some(i), "key: {}", i);
         }
-
-        for i in 1..100 {
-            assert!(list.get(i).is_none());
-        }
-    }
-
-    #[test]
-    fn test_is_sorted() {
-        let list = MdMap::new();
-        for i in [1, 3, 4, 7, 2, 5, 6] {
-            list.insert(i, i * 10);
-        }
-
-        assert_eq!(
-            list.iter().map(|x| *x).collect::<Vec<_>>(),
-            [10, 20, 30, 40, 50, 60, 70]
-        );
     }
 
     #[test]
@@ -815,26 +785,28 @@ mod tests {
         use rayon::prelude::*;
         let mdlist = MdMap::new();
         let md_ref = &mdlist;
-        for _ in 0..1000 {
-            (1..300).into_par_iter().for_each(|i| {
+        (1..100).into_par_iter().for_each(|_| {
+            for i in 1..1000 {
                 md_ref.insert(i, i);
-            });
+            }
+        });
 
-            (1..300).into_iter().for_each(|i| {
-                assert!(md_ref.contains(i));
-            });
-        }
+        (1..100).into_iter().for_each(|_| {
+            for i in 1..1000 {
+                assert!(md_ref.contains(&i));
+            }
+        });
         drop(mdlist);
     }
 
     #[test]
-    fn test_pop_front() {
-        let list = MdMap::new();
-        list.insert(1, 10);
-        list.insert(3, 30);
-        list.insert(2, 20);
-        assert_eq!(list.pop_front(), Some(10));
-        assert_eq!(list.pop_front(), Some(20));
-        assert_eq!(list.pop_front(), Some(30));
+    fn test_key_to_coord() {
+        for i in 0..(1 << 8) {
+            let v = Inner::<usize>::key_to_coord(i)
+                .into_iter()
+                .map(|s| s.to_string())
+                .collect::<String>();
+            dbg!(v);
+        }
     }
 }
