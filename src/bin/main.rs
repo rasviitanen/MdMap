@@ -1,3 +1,4 @@
+#![allow(warnings)]
 use dashmap::DashMap;
 use dhat::{Dhat, DhatAlloc};
 use mdmap::{FakeHashBuilder, MdMap};

@@ -15,24 +15,21 @@
 
 Items in MdMap are stored in a multi-dimensional linked list.
 This makes it possible to achieve logarithmic search performance, and allow many threads to operate on the list in parallel.
+An effect of this is that keys are sorted, which makes this suitable for things like priority queues.
 
-Here are some _experimental_ benchmarks, where we see that MdMap performs really well for get operations.
+Here are some _experimental_ and **INCREDIBLY BIASED** benchmarks, where we see that MdMap performs really when contention is high. One can imagine using `MdMap` for applications that have huge pressure on just a few keys.
 
-![get](./get.svg)
+![get](./violin.svg)
 
-Insert is not as quick, but still faster than Mutex<Hasmap>.
-
-![insert](./insert.svg)
-
-**Disclaimer**: MdMap is still under development and I am working on improving its performance. As of now, Dashmap is faster for most workloads.
+**Disclaimer**: MdMap is still under development and I am working on improving its performance. Dashmap is faster for most workloads.
 
 ## Todo
 
 - Does not yet support updating values
 - Does not yet support the value `0` as the key, as this is reserved for the head
 - Check for memory leaks
+- Figure out a better hashing situation
 - Test
-- Add hashing to allow hashable types as keys
 
 ## Based on these papers
 

@@ -7,17 +7,18 @@ use epoch::{CompareAndSetError, Owned};
 use std::borrow::{Borrow, BorrowMut};
 use std::collections::hash_map::RandomState;
 use std::hash::Hasher;
-use std::ops::{BitXor, Deref};
+#[allow(unused_imports)]
 use std::simd::Simd;
+use std::sync::atomic::Ordering;
 use std::sync::atomic::Ordering::{Relaxed, SeqCst};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{
     hash::{BuildHasher, Hash},
     mem::{self},
 };
 
-const DIMENSION: usize = 16;
+const DIMENSION: usize = 8;
 const BASIS: usize = 16;
+#[allow(clippy::declare_interior_mutable_const)]
 const NULL: Atomic<()> = Atomic::null();
 
 #[inline]
@@ -153,7 +154,7 @@ pub struct MdNode<T> {
 
 impl<T> Default for MdNode<T> {
     fn default() -> Self {
-        Self::new_uninit(0, 0)
+        Self::new_uninit(0)
     }
 }
 
@@ -205,9 +206,11 @@ impl<T> std::ops::Drop for MdNode<T> {
 }
 
 impl<T> MdNode<T> {
+    #[allow(clippy::declare_interior_mutable_const)]
     const NULL_CHILDREN: [Atomic<Self>; DIMENSION] =
         unsafe { std::mem::transmute([NULL; DIMENSION]) };
-    pub fn new(key: usize, val: T, dim: usize) -> Self {
+
+    pub fn new(key: usize, val: T) -> Self {
         Self {
             val: Some(val),
             coord: Inner::<T>::key_to_coord(key),
@@ -216,7 +219,7 @@ impl<T> MdNode<T> {
         }
     }
 
-    pub fn new_uninit(key: usize, dim: usize) -> Self {
+    pub fn new_uninit(key: usize) -> Self {
         Self {
             val: None,
             coord: Inner::<T>::key_to_coord(key),
@@ -225,7 +228,7 @@ impl<T> MdNode<T> {
         }
     }
 
-    pub fn with_coord(coord: [u8; DIMENSION], val: T, dim: usize) -> Self {
+    pub fn with_coord(coord: [u8; DIMENSION], val: T) -> Self {
         Self {
             val: Some(val),
             coord,
@@ -284,7 +287,7 @@ pub enum InsertStatus {
 
 impl<'g, T> Inner<T> {
     pub fn new() -> Self {
-        let head = Atomic::new(MdNode::new_uninit(0, 0));
+        let head = Atomic::new(MdNode::new_uninit(0));
         Self { head }
     }
 
@@ -303,7 +306,6 @@ impl<'g, T> Inner<T> {
     }
 
     pub unsafe fn get(&self, key: usize, guard: &Guard) -> Option<Entry<'_, 'g, T>> {
-        // Rebind lifetime to self
         let guard = &*(guard as *const _);
 
         let coord = Self::key_to_coord(key);
@@ -315,9 +317,8 @@ impl<'g, T> Inner<T> {
         Self::locate_pred(&coord, ad, pred, curr, &mut dim, &mut pred_dim, guard);
         if dim == DIMENSION {
             let curr_ref = curr.as_ref()?;
-            if curr_ref.val.is_none() {
-                return None;
-            }
+
+            curr_ref.val.as_ref()?;
 
             return Some(Entry {
                 node: curr_ref,
@@ -351,8 +352,9 @@ impl<'g, T> Inner<T> {
                     .children
                     .get_unchecked(*pred_dim)
                     .load(SeqCst, guard);
-                // makr node for deletion
-                let new_child = match pred_ref
+
+                // mark node for deletion
+                let _new_child = match pred_ref
                     .children
                     .get_unchecked(*pred_dim)
                     .compare_and_set(*curr, marked, SeqCst, guard)
@@ -373,11 +375,10 @@ impl<'g, T> Inner<T> {
         }
     }
 
-    #[inline(never)]
     pub unsafe fn insert(&self, key: usize, val: T) -> InsertStatus {
         let guard = &epoch::pin();
         let coord = Inner::<T>::key_to_coord(key);
-        let mut new_node = Owned::new(MdNode::with_coord(coord, val, 0));
+        let mut new_node = Owned::new(MdNode::with_coord(coord, val));
 
         loop {
             let dim = &mut 0;
@@ -497,13 +498,12 @@ impl<'g, T> Inner<T> {
 
         for d in (0..DIMENSION).rev() {
             coord[d] = (quotient % BASIS) as u8;
-            quotient = quotient / BASIS;
+            quotient /= BASIS;
         }
 
         coord
     }
 
-    #[inline(never)]
     unsafe fn locate_pred<'t>(
         coord: &[u8; DIMENSION],
         ad: &mut Shared<'_, MdDesc<T>>,
@@ -561,7 +561,6 @@ impl<'g, T> Inner<T> {
         *pred_dim = pd;
     }
 
-    #[inline(never)]
     fn fill_new_node<'a>(
         new_node: &mut MdNode<T>,
         curr: Shared<'a, MdNode<T>>,
@@ -583,8 +582,7 @@ impl<'g, T> Inner<T> {
 
         for i in 0..*pred_dim {
             new_node.children[i].store(
-                Shared::null().with_tag(0x1),
-                // new_node.children[i].load(Relaxed, guard).with_tag(0x1),
+                new_node.children[i].load(Relaxed, guard).with_tag(0x1),
                 Relaxed,
             );
         }
@@ -611,10 +609,8 @@ impl<'g, T> Inner<T> {
             let child = child.fetch_or(0x1, SeqCst, guard);
             let child = child.with_tag(clr_adpinv(child.tag()));
 
-            if !child.is_null() {
-                if n.children[i].load(Relaxed, guard).is_null() {
-                    let _ = n.children[i].compare_and_set(Shared::null(), child, SeqCst, guard);
-                }
+            if !child.is_null() && n.children[i].load(Relaxed, guard).is_null() {
+                let _ = n.children[i].compare_and_set(Shared::null(), child, SeqCst, guard);
             }
         }
 
@@ -749,9 +745,9 @@ mod tests {
 
     #[test]
     fn test_insert() {
-        let list = MdMap::new();
-        list.insert(0, 10);
-        assert_eq!(*list.get(&0).unwrap(), 10);
+        let list = MdMap::<usize, usize>::new();
+        list.insert(123, 10);
+        assert_eq!(*list.get(&123).unwrap(), 10);
     }
 
     #[test]
@@ -769,7 +765,6 @@ mod tests {
         for i in 0..100 {
             list.insert(i, i);
         }
-        dbg!(&list);
 
         for i in 0..100 {
             assert_eq!(list.get(&i).map(|v| *v), Some(i), "key: {}", i);
@@ -782,7 +777,6 @@ mod tests {
 
     #[test]
     fn test_parallel() {
-        use rayon::prelude::*;
         let mdlist = MdMap::new();
         let md_ref = &mdlist;
         (1..100).into_par_iter().for_each(|_| {
@@ -791,7 +785,7 @@ mod tests {
             }
         });
 
-        (1..100).into_iter().for_each(|_| {
+        (1..100).into_par_iter().for_each(|_| {
             for i in 1..1000 {
                 assert!(md_ref.contains(&i));
             }
@@ -800,6 +794,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "manual inspection of key entropy"]
     fn test_key_to_coord() {
         for i in 0..(1 << 8) {
             let v = Inner::<usize>::key_to_coord(i)
