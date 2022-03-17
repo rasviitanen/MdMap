@@ -15,9 +15,9 @@ enum Instruction {
 
 pub fn small_key_space_high_contention(c: &mut Criterion) {
     let mut dist = c.benchmark_group("small_key_space_high_contention");
-    let insert_percentage = 5;
-    let grow_range = 0..200;
-    let selection_range = 0..5;
+    let insert_percentage = 20;
+    let grow_range = 0..100;
+    let selection_range = 50..60;
     let n_ops = 25_000;
 
     let mut rng = thread_rng();
@@ -82,9 +82,9 @@ pub fn small_key_space_high_contention(c: &mut Criterion) {
 
 pub fn medium_key_space_high_contention(c: &mut Criterion) {
     let mut dist = c.benchmark_group("medium_key_space_high_contention");
-    let insert_percentage = 5;
-    let grow_range = 0..2000;
-    let selection_range = 0..5;
+    let insert_percentage = 20;
+    let grow_range = 0..1000;
+    let selection_range = 50..60;
     let n_ops = 25_000;
 
     let mut rng = thread_rng();
@@ -150,6 +150,6 @@ pub fn medium_key_space_high_contention(c: &mut Criterion) {
 criterion_group!(
     benches,
     small_key_space_high_contention,
-    medium_key_space_high_contention
+    medium_key_space_high_contention,
 );
 criterion_main!(benches);

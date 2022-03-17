@@ -37,10 +37,6 @@ fn main() {
             time.as_micros(),
             time.as_nanos() / range as u128
         );
-        std::mem::forget(map);
-
-        // dbg!(&map);
-        // dbg!(&map);
     }
 
     // (1..30).into_par_iter().for_each(|i| {

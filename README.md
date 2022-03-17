@@ -3,8 +3,7 @@
 
   <h2>MdMap</h2>
   <p>
-    MdMap is a lock-free multi-dimensional list which can replace e.g. HashMap or DashMap
-    for fast concurrent/parallel access.
+    MdMap is a lock-free data structure that can act as a replacment for  e.g. HashMap or DashMap.
   </p>
 
 <sub>💥 UNSTABLE 💥 <br> MdMap has not been thoroughly tested and is probably filled with bugs</sub>
@@ -14,14 +13,14 @@
 ## Performance
 
 Items in MdMap are stored in a multi-dimensional linked list.
-This makes it possible to achieve logarithmic search performance, and allow many threads to operate on the list in parallel.
-An effect of this is that keys are sorted, which makes this suitable for things like priority queues.
+This makes it possible to achieve logarithmic search performance while allowing many threads to operate on the list in parallel.
+An effect of the multi-dimensional list is that keys are sorted, which makes this suitable for things like priority queues.
 
 Here are some _experimental_ and **INCREDIBLY BIASED** benchmarks, where we see that MdMap performs really when contention is high. One can imagine using `MdMap` for applications that have huge pressure on just a few keys.
 
 ![get](./violin.svg)
 
-**Disclaimer**: MdMap is still under development and I am working on improving its performance. Dashmap is faster for most workloads.
+**Disclaimer**: MdMap is still under development and I am working on improving its performance. DashMap is faster for most workloads (if not all).
 
 ## Todo
 

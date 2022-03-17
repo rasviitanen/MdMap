@@ -9,11 +9,10 @@ use std::collections::hash_map::RandomState;
 use std::hash::Hasher;
 #[allow(unused_imports)]
 use std::simd::Simd;
-use std::sync::atomic::Ordering;
-use std::sync::atomic::Ordering::{Relaxed, SeqCst};
 use std::{
     hash::{BuildHasher, Hash},
     mem::{self},
+    sync::atomic::Ordering::{self, Relaxed, SeqCst},
 };
 
 const DIMENSION: usize = 8;
@@ -54,12 +53,6 @@ fn clr_invalid(p: usize) -> usize {
 #[inline]
 fn is_invalid(p: usize) -> bool {
     p & 0x3 != 0
-}
-
-#[derive(Debug)]
-pub enum LocatePredStatus {
-    Found,
-    LogicallyRemoved,
 }
 
 pub struct Entry<'t, 'g, T> {
@@ -477,18 +470,15 @@ impl<'g, T> Inner<T> {
     }
 
     // #[inline]
-    // fn key_to_coord(key: usize) -> [u8; DIMENSION] {
-    //     let v = key.to_le_bytes();
+    // const fn key_to_coord(key: usize) -> [u8; DIMENSION] {
+    //     key.to_le_bytes()
 
-    //     let q = Simd::from_array([
-    //         v[7], v[7], v[6], v[6], v[5], v[5], v[4], v[4], v[3], v[3], v[2], v[2], v[1], v[1],
-    //         v[0], v[0],
-    //     ]);
-    //     const MASK: Simd<u8, 16> = Simd::from_array([
-    //         0xF0, 0x0F, 0xF0, 0x0F, 0xF0, 0x0F, 0xF0, 0x0F, 0xF0, 0x0F, 0xF0, 0x0F, 0xF0, 0x0F,
-    //         0xF0, 0x0F,
-    //     ]);
-    //     (q & MASK).to_array()
+    //     // let q = Simd::from_array([v[7], v[6], v[5], v[4], v[3], v[2], v[1], v[0]]);
+    //     // const MASK: Simd<u8, 16> = Simd::from_array([
+    //     //     0xF0, 0x0F, 0xF0, 0x0F, 0xF0, 0x0F, 0xF0, 0x0F, 0xF0, 0x0F, 0xF0, 0x0F, 0xF0, 0x0F,
+    //     //     0xF0, 0x0F,
+    //     // ]);
+    //     // (q & MASK).to_array()
     // }
 
     #[inline]
@@ -779,16 +769,12 @@ mod tests {
     fn test_parallel() {
         let mdlist = MdMap::new();
         let md_ref = &mdlist;
-        (1..100).into_par_iter().for_each(|_| {
-            for i in 1..1000 {
-                md_ref.insert(i, i);
-            }
+        (1..30_000).into_par_iter().for_each(|i| {
+            md_ref.insert(i, i);
         });
 
-        (1..100).into_par_iter().for_each(|_| {
-            for i in 1..1000 {
-                assert!(md_ref.contains(&i));
-            }
+        (1..30_000).into_par_iter().for_each(|i| {
+            assert!(md_ref.contains(&i));
         });
         drop(mdlist);
     }
@@ -797,11 +783,8 @@ mod tests {
     #[ignore = "manual inspection of key entropy"]
     fn test_key_to_coord() {
         for i in 0..(1 << 8) {
-            let v = Inner::<usize>::key_to_coord(i)
-                .into_iter()
-                .map(|s| s.to_string())
-                .collect::<String>();
-            dbg!(v);
+            let coord = Inner::<usize>::key_to_coord(i);
+            println!("{:>4}: {:^2?}", usize::from_be_bytes(coord), coord);
         }
     }
 }
