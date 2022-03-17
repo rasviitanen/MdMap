@@ -18,6 +18,24 @@ An effect of the multi-dimensional list is that keys are sorted, which makes thi
 
 Here are some _experimental_ and **INCREDIBLY BIASED** benchmarks, where we see that MdMap performs really when contention is high. One can imagine using `MdMap` for applications that have huge pressure on just a few keys.
 
+### Benchmark
+
+```
+[benchmark]
+executing 1000 ops
+map size: 1000 entries (pre-filled)
+operation distribution: 8% insert; 92% get
+operationg on keys: [100, 200, 300, 400, 500, 600, 700]
+distributions:
+  "100": 74%
+  "200": 12%
+  "300": 6%
+  "400": 3%
+  "500": 3%
+  "600": 1%
+  "700": 1%
+```
+
 ![get](./violin.svg)
 
 **Disclaimer**: MdMap is still under development and I am working on improving its performance. DashMap is faster for most workloads (if not all).
