@@ -1,4 +1,3 @@
-#![feature(portable_simd)]
 #![allow(dead_code)]
 #![allow(clippy::missing_safety_doc)]
 
@@ -7,8 +6,6 @@ use epoch::{CompareAndSetError, Owned};
 use std::borrow::{Borrow, BorrowMut};
 use std::collections::hash_map::RandomState;
 use std::hash::Hasher;
-#[allow(unused_imports)]
-use std::simd::Simd;
 use std::{
     hash::{BuildHasher, Hash},
     mem::{self},
@@ -468,18 +465,6 @@ impl<'g, T> Inner<T> {
 
         dim == DIMENSION
     }
-
-    // #[inline]
-    // const fn key_to_coord(key: usize) -> [u8; DIMENSION] {
-    //     key.to_le_bytes()
-
-    //     // let q = Simd::from_array([v[7], v[6], v[5], v[4], v[3], v[2], v[1], v[0]]);
-    //     // const MASK: Simd<u8, 16> = Simd::from_array([
-    //     //     0xF0, 0x0F, 0xF0, 0x0F, 0xF0, 0x0F, 0xF0, 0x0F, 0xF0, 0x0F, 0xF0, 0x0F, 0xF0, 0x0F,
-    //     //     0xF0, 0x0F,
-    //     // ]);
-    //     // (q & MASK).to_array()
-    // }
 
     #[inline]
     fn key_to_coord(key: usize) -> [u8; DIMENSION] {
