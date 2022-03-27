@@ -96,6 +96,48 @@ pub fn small_key_space_high_contention(c: &mut Criterion) {
         })
     });
     drop(collection);
+
+    let collection = std::sync::Mutex::new(std::collections::HashMap::new());
+    for i in grow_range.clone() {
+        collection.lock().unwrap().insert(i, i);
+    }
+    group.bench_function("Mutex<HashMap>", |b| {
+        b.iter(|| {
+            key_range
+                .par_iter()
+                .copied()
+                .for_each(|instruction| match instruction {
+                    Instruction::Insert(k, v) => {
+                        collection.lock().unwrap().insert(black_box(k), v);
+                    }
+                    Instruction::Get(k) => {
+                        collection.lock().unwrap().get(black_box(&k));
+                    }
+                });
+        })
+    });
+    drop(collection);
+
+    let collection = std::sync::RwLock::new(std::collections::HashMap::new());
+    for i in grow_range.clone() {
+        collection.write().unwrap().insert(i, i);
+    }
+    group.bench_function("RwLock<HashMap>", |b| {
+        b.iter(|| {
+            key_range
+                .par_iter()
+                .copied()
+                .for_each(|instruction| match instruction {
+                    Instruction::Insert(k, v) => {
+                        collection.write().unwrap().insert(black_box(k), v);
+                    }
+                    Instruction::Get(k) => {
+                        collection.read().unwrap().get(black_box(&k));
+                    }
+                });
+        })
+    });
+    drop(collection);
 }
 
 criterion_group!(benches, small_key_space_high_contention,);
