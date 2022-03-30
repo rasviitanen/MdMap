@@ -2,7 +2,7 @@
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use dashmap::DashMap;
-use mdmap::MdMap;
+use mdcollections::{MdList, MdMap};
 use rand::distributions::WeightedIndex;
 use rand::prelude::*;
 use rayon::prelude::*;
@@ -17,8 +17,8 @@ pub fn small_key_space_high_contention(c: &mut Criterion) {
     let mut group = c.benchmark_group("small_key_space_high_contention");
     let insert_percentage = 8;
     let grow_range = 0..1_000;
-    let operate_on_keys = [100, 200, 300, 400, 500, 600, 700];
-    let weights = [74, 12, 6, 3, 3, 1, 1];
+    let operate_on_keys = [672, 123, 493, 192, 12, 803, 366, 44, 982, 500];
+    let weights = [73, 10, 6, 4, 2, 1, 1, 1, 1, 1];
     assert_eq!(weights.iter().sum::<usize>(), 100);
     let n_ops = 1_000;
 
@@ -55,7 +55,7 @@ pub fn small_key_space_high_contention(c: &mut Criterion) {
         })
         .collect::<Vec<_>>();
 
-    let collection = MdMap::new();
+    let collection = MdMap::default();
     for i in grow_range.clone() {
         collection.insert(i, i);
     }
@@ -140,5 +140,5 @@ pub fn small_key_space_high_contention(c: &mut Criterion) {
     drop(collection);
 }
 
-criterion_group!(benches, small_key_space_high_contention,);
+criterion_group!(benches, small_key_space_high_contention);
 criterion_main!(benches);

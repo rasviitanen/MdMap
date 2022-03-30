@@ -1,20 +1,24 @@
 [package]
-name = "mdmap"
+name = "mdcollections"
 version = "0.1.0"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-crossbeam-epoch = { version = "0.8" }
-crossbeam-utils = "0.7"
+crossbeam-epoch = { version = "0.9" }
+crossbeam-utils = "0.8"
 
 [dev-dependencies]
 criterion = "0.3"
 rand = "0.8"
 rayon = "1.5"
 dashmap = "5.0"
+crossbeam-epoch = { version = "0.9", features = ["loom"] }
 
 [[bench]]
 name = "mdmap"
 harness = false
+
+[profile.release]
+debug = true
