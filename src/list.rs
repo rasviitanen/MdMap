@@ -1,9 +1,9 @@
 use crossbeam_epoch::{self as epoch, Atomic, CompareExchangeError, Guard, Owned, Shared};
-use crossbeam_utils::CachePadded;
+use crossbeam_utils::{Backoff, CachePadded};
 use std::{
     borrow::BorrowMut,
     mem::{self, MaybeUninit},
-    ops::Range,
+    ops::{DerefMut, Range},
     ptr,
     sync::atomic::{AtomicUsize, Ordering},
 };
@@ -398,7 +398,7 @@ impl<'g, T, const BASE: usize, const DIM: usize> MdList<T, BASE, DIM> {
             let guard = &epoch::pin();
             let coord = Self::key_to_coord(key);
             let mut new_node = Owned::new(MdNode::with_coord(coord, val));
-            // let backoff = Backoff::new();
+            let backoff = Backoff::new();
             loop {
                 let curr = &mut self.head.load(Ordering::Relaxed, epoch::unprotected());
                 let pred: &mut Shared<'_, MdNode<T, BASE, DIM>> = &mut Shared::null();
@@ -465,7 +465,7 @@ impl<'g, T, const BASE: usize, const DIM: usize> MdList<T, BASE, DIM> {
                             if !desc.is_null() {
                                 drop(desc.into_owned());
                             }
-                            // backoff.spin();
+                            backoff.spin();
                         }
                     }
                 }

@@ -16,37 +16,98 @@ An effect of the multi-dimensional list is that keys are sorted, which makes thi
 
 ## Performance
 
-Here are some _experimental_ and **INCREDIBLY BIASED** benchmarks, where we see that MdMap performs really when contention is high. One can imagine using `MdMap` for applications that have huge pressure on just a few keys.
+Other concurrent data structures builds on sharding (e.g. `DashMap`).
+Doing this on a few keys, such as with an exponential key distribution can lead to a lot of lock contention and poor performance.
 
-### Benchmark 1
+Skiplists is another alternative commonly used for concurrent data structures, however concurrency in
+these can be limited under write-heavy loads.
+
+MdMap uses multi-dimensional linked lists (which makes it more of a `MdTreeMap` perhaps) where scalar keys
+acts as coordinates into the underlying structure. This has a couple of befits over other approaches, where MdMap doesn't require
+balancing (seen in e.g. BSTs), randomization (e.g. skiplists) nor mutex-based locks (e.g. shard based).
+This makes it quite fast under some loads compared to other solutions.
+
+**Disclaimer**: MdMap is still under development and I am working on improving its performance. It's still pretty
+slow for most workloads, but looks quite promising :)
+
+### Benchmarks
+
+Here are some _experimental_ and **INCREDIBLY BIASED** benchmarks, where we see that MdMap performs really when pressure is high on just a few keys.
+
+---
+
+**Exponential key distribution**
 
 ```
-- executing 1000 ops
-- map size: 1000 entries (pre-filled)
-- operation distribution: 8% insert; 92% get
-- operationg on keys: [100, 200, 300, 400, 500, 600, 700]
-- key distributions:
-  100: 74%
-  200: 12%
-  300: 6%
-  400: 3%
-  500: 3%
-  600: 1%
-  700: 1%
+[config]
+map size: 1000 entries (prefilled)
+operation distribution: 98% get; 2% insert
+operationg on: [672, 123, 493, 192, 12, 803, 366, 44, 982, 500]
+executing: 3000 ops
+key distribution: `exponential`
+key distribution summary:
+---------------------------------
+| key |    ops     | percentage |
+=================================
+| 672 | ~    0 ops |    0.0078% |
+| 123 | ~    0 ops |    0.0156% |
+| 493 | ~    1 ops |    0.0546% |
+| 192 | ~    4 ops |    0.1561% |
+|  12 | ~   12 ops |    0.4214% |
+| 803 | ~   34 ops |    1.1550% |
+| 366 | ~   94 ops |    3.1450% |
+|  44 | ~  256 ops |    8.5531% |
+| 982 | ~  697 ops |   23.2558% |
+| 500 | ~ 1897 ops |   63.2355% |
+--------------------------------
 ```
 
-| MdMap     | DashMap   | Mutex<HashMap> | RwLock<HashMap> |
-| --------- | --------- | -------------- | --------------- |
-| 64.733 us | 144.78 us | 202.91 us      | 182.69 us       |
+| `MdMap`   | `DashMap` | `Mutex<HashMap>` | `RwLock<HashMap>` |
+| --------- | --------- | ---------------- | ----------------- |
+| 130.69 us | 291.98 us | 324.87 us        | 371.47 us         |
 
-![get](./violin.svg)
-**Disclaimer**: MdMap is still under development and I am working on improving its performance. DashMap is faster for most realistic workloads.
+![get](./violin1.svg)
+
+---
+
+**Uniform key distribution**
+
+```
+[config]
+map size: 1000 entries (prefilled with 0..1000)
+operation distribution: 98% get; 2% insert
+operationg on: [672, 123, 493, 192, 12, 803, 366, 44, 982, 500]
+executing: 3000 ops
+key distribution: `uniform`
+key distribution summary:
+---------------------------------
+| key |    ops     | percentage |
+=================================
+| 672 | ~  300 ops |   10.0000% |
+| 123 | ~  300 ops |   10.0000% |
+| 493 | ~  300 ops |   10.0000% |
+| 192 | ~  300 ops |   10.0000% |
+|  12 | ~  300 ops |   10.0000% |
+| 803 | ~  300 ops |   10.0000% |
+| 366 | ~  300 ops |   10.0000% |
+|  44 | ~  300 ops |   10.0000% |
+| 982 | ~  300 ops |   10.0000% |
+| 500 | ~  300 ops |   10.0000% |
+--------------------------------
+```
+
+| `MdMap`   | `DashMap` | `Mutex<HashMap>` | `RwLock<HashMap>` |
+| --------- | --------- | ---------------- | ----------------- |
+| 129.94 us | 129.53 us | 324.38 us        | 373.86 us         |
+
+![get](./violin2.svg)
 
 ## Todo
 
 - Does not yet support updating values safely
+- Does not yet support removing values safely
 - Does not yet support the value `0` as the key, which is reserved for the head
-- Check for memory leaks
+- Check for memory leaks (some leaks are known)
 - Figure out a better hashing situation
 - Test
 
