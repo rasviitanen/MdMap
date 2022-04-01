@@ -1,5 +1,5 @@
 use crossbeam_epoch::{self as epoch, Atomic, CompareExchangeError, Guard, Owned, Shared};
-use crossbeam_utils::{Backoff, CachePadded};
+use crossbeam_utils::CachePadded;
 use std::{
     borrow::BorrowMut,
     mem::{self, MaybeUninit},
@@ -172,14 +172,6 @@ impl<T: std::fmt::Debug, const BASE: usize, const DIM: usize> std::fmt::Debug
 impl<T, const BASE: usize, const DIM: usize> MdNode<T, BASE, DIM> {
     fn unsafe_drop_value(&mut self) {
         unsafe {
-            if !self
-                .pending
-                .load(Ordering::Relaxed, epoch::unprotected())
-                .is_null()
-            {
-                drop(mem::replace(&mut self.pending, Atomic::null()).into_owned());
-            }
-
             ptr::drop_in_place(self.val.as_mut_ptr());
         }
     }
@@ -406,7 +398,7 @@ impl<'g, T, const BASE: usize, const DIM: usize> MdList<T, BASE, DIM> {
             let guard = &epoch::pin();
             let coord = Self::key_to_coord(key);
             let mut new_node = Owned::new(MdNode::with_coord(coord, val));
-            let backoff = Backoff::new();
+            // let backoff = Backoff::new();
             loop {
                 let curr = &mut self.head.load(Ordering::Relaxed, epoch::unprotected());
                 let pred: &mut Shared<'_, MdNode<T, BASE, DIM>> = &mut Shared::null();
@@ -459,7 +451,7 @@ impl<'g, T, const BASE: usize, const DIM: usize> MdList<T, BASE, DIM> {
                                 let raw = curr.as_raw();
                                 guard.defer_unchecked(move || {
                                     let node = &mut *(raw as *mut MdNode<T, BASE, DIM>);
-                                    node.unsafe_drop();
+                                    node.unsafe_drop_value();
                                 });
                                 Ref {
                                     val: (*curr.as_raw()).val.assume_init_ref(),
@@ -473,7 +465,7 @@ impl<'g, T, const BASE: usize, const DIM: usize> MdList<T, BASE, DIM> {
                             if !desc.is_null() {
                                 drop(desc.into_owned());
                             }
-                            backoff.spin();
+                            // backoff.spin();
                         }
                     }
                 }
