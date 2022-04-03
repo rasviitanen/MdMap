@@ -3,7 +3,7 @@ use crossbeam_utils::{Backoff, CachePadded};
 use std::{
     borrow::BorrowMut,
     mem::{self, MaybeUninit},
-    ops::{DerefMut, Range},
+    ops::Range,
     ptr,
     sync::atomic::{AtomicUsize, Ordering},
 };
@@ -178,20 +178,17 @@ impl<T, const BASE: usize, const DIM: usize> MdNode<T, BASE, DIM> {
 
     fn unsafe_drop(&mut self) {
         unsafe {
-            if !self
-                .pending
-                .load(Ordering::Relaxed, epoch::unprotected())
-                .is_null()
-            {
-                drop(mem::replace(&mut self.pending, Atomic::null()).into_owned());
-            }
-
             ptr::drop_in_place(self.val.as_mut_ptr());
+
+            let pending = mem::replace(&mut self.pending, Atomic::null());
+            if !self.pending.load_consume(epoch::unprotected()).is_null() {
+                pending.into_owned();
+            }
 
             let children = mem::replace(&mut self.children, [(); DIM].map(|_| Atomic::null()));
             for child in children {
                 let child_ref = child.load(Ordering::Relaxed, epoch::unprotected());
-                if !child_ref.is_null() && !is_invalid(child_ref.tag()) {
+                if !child_ref.is_null() && !is_adpinv(child_ref.tag()) {
                     child.into_owned().unsafe_drop();
                 }
             }
@@ -259,6 +256,17 @@ impl<const DIM: usize> Location<DIM> {
     }
 
     #[inline]
+    fn reset(&mut self) {
+        self.cd = 0;
+        self.pd = 0;
+    }
+
+    #[inline]
+    fn step_back(&mut self) {
+        self.cd = self.pd;
+    }
+
+    #[inline]
     fn goto_next_dimension(&mut self) {
         self.cd += 1;
     }
@@ -275,7 +283,7 @@ impl<const DIM: usize> Location<DIM> {
 
     #[inline]
     fn curr_selection_contains(&self, dim: usize) -> bool {
-        self.pd <= dim && dim <= self.cd
+        dim >= self.pd && dim <= self.cd
     }
 }
 
@@ -322,12 +330,11 @@ impl<'g, T, const BASE: usize, const DIM: usize> MdList<T, BASE, DIM> {
     pub fn get(&self, key: usize) -> Option<Ref<'_, T>> {
         let coord = Self::key_to_coord(key);
         let pred = &mut Shared::null();
-        let ad = &mut Shared::null();
 
         unsafe {
             let curr = &mut self.head.load(Ordering::Relaxed, epoch::unprotected());
             let guard = &*(&epoch::pin() as *const _);
-            let location = Self::locate_pred(&coord, ad, pred, curr, guard);
+            let location = Self::locate_pred(&coord, Location::default(), pred, curr, guard);
             if location.exists() {
                 if is_invalid(curr.tag()) {
                     return None;
@@ -347,10 +354,9 @@ impl<'g, T, const BASE: usize, const DIM: usize> MdList<T, BASE, DIM> {
         let guard = &epoch::pin();
         let coord = Self::key_to_coord(key);
         loop {
-            let ad = &mut Shared::null();
             let curr = &mut self.head.load(Ordering::Relaxed, epoch::unprotected());
             let pred: &mut Shared<'_, MdNode<T, BASE, DIM>> = &mut Shared::null();
-            let location = Self::locate_pred(&coord, ad, pred, curr, guard);
+            let location = Self::locate_pred(&coord, Location::default(), pred, curr, guard);
 
             if !location.exists() {
                 // Could not find node to delete
@@ -397,77 +403,95 @@ impl<'g, T, const BASE: usize, const DIM: usize> MdList<T, BASE, DIM> {
         unsafe {
             let guard = &epoch::pin();
             let coord = Self::key_to_coord(key);
+            // let backoff = Backoff::new();
             let mut new_node = Owned::new(MdNode::with_coord(coord, val));
-            let backoff = Backoff::new();
+            let mut location = Location::default();
+            let curr = &mut self.head.load(Ordering::Relaxed, epoch::unprotected());
+            let pred: &mut Shared<'_, MdNode<T, BASE, DIM>> = &mut Shared::null();
+
             loop {
-                let curr = &mut self.head.load(Ordering::Relaxed, epoch::unprotected());
-                let pred: &mut Shared<'_, MdNode<T, BASE, DIM>> = &mut Shared::null();
-                let ad: &mut Shared<'_, MdDesc<T, BASE, DIM>> = &mut Shared::null();
-
-                let mut location = Self::locate_pred(&coord, ad, pred, curr, guard);
-
+                let found_location = Self::locate_pred(&coord, location, pred, curr, guard);
+                location = found_location;
                 let is_update = location.exists() && !is_delinv(curr.tag());
 
-                if !location.is_conflict() {
-                    if let Some(curr_ref) = curr.as_ref() {
-                        let pending = curr_ref.pending.load(Ordering::Relaxed, guard);
-                        *ad = pending;
-                        if !pending.is_null() {
-                            Self::finish_inserting(curr_ref, pending, guard);
-                        }
-                    }
-                }
-
                 if let Some(pred_ref) = pred.as_ref() {
-                    let child = pred_ref
+                    let pred_child = pred_ref
                         .children
                         .get_unchecked(location.pd)
                         .load(Ordering::Acquire, guard);
-                    if is_delinv(child.tag()) {
-                        *curr = curr.with_tag(set_delinv(curr.tag()));
+                    let mut expected = *curr;
+
+                    if is_delinv(pred_child.tag()) {
+                        expected = curr.with_tag(set_delinv(curr.tag()));
                         location.try_bump_to_max();
                     }
 
-                    let desc =
-                        Self::fill_new_node(new_node.borrow_mut(), *curr, &mut location, guard);
+                    if pred_child == expected.into() {
+                        Self::fill_new_node(new_node.borrow_mut(), expected, &mut location, guard);
 
-                    match pred_ref
-                        .children
-                        .get_unchecked(location.pd)
-                        .compare_exchange_weak(
-                            *curr,
-                            new_node,
-                            Ordering::SeqCst,
-                            Ordering::Relaxed,
-                            guard,
-                        ) {
-                        Ok(mut new_node) => {
-                            if !desc.is_null() {
-                                Self::finish_inserting(new_node.deref_mut(), desc, guard);
-                                drop(desc.into_owned());
-                            }
+                        match pred_ref
+                            .children
+                            .get_unchecked(location.pd)
+                            .compare_exchange_weak(
+                                expected,
+                                new_node,
+                                Ordering::SeqCst,
+                                Ordering::Relaxed,
+                                guard,
+                            ) {
+                            Ok(mut new_node) => {
+                                let desc = new_node.deref().pending.load(Ordering::Relaxed, guard);
+                                if !desc.is_null() {
+                                    if let Some(curr_ref) = curr.as_ref() {
+                                        let pending =
+                                            curr_ref.pending.load(Ordering::Relaxed, guard);
+                                        if !pending.is_null() {
+                                            Self::finish_inserting(curr_ref, pending, guard);
+                                        }
+                                    }
 
-                            let val = is_update.then(|| {
-                                let raw = curr.as_raw();
-                                guard.defer_unchecked(move || {
-                                    let node = &mut *(raw as *mut MdNode<T, BASE, DIM>);
-                                    node.unsafe_drop_value();
-                                });
-                                Ref {
-                                    val: (*curr.as_raw()).val.assume_init_ref(),
+                                    Self::finish_inserting(new_node.deref_mut(), desc, guard);
                                 }
-                            });
-                            self.len.fetch_add(1, Ordering::Relaxed);
-                            return val;
-                        }
-                        Err(err) => {
-                            new_node = err.new;
-                            if !desc.is_null() {
-                                drop(desc.into_owned());
+
+                                let val = is_update.then(|| {
+                                    let raw = expected.as_raw();
+                                    guard.defer_unchecked(move || {
+                                        let mut node =
+                                            Owned::from_raw(raw as *mut MdNode<T, BASE, DIM>);
+                                        node.unsafe_drop_value();
+                                    });
+
+                                    Ref {
+                                        val: (*curr.as_raw()).val.assume_init_ref(),
+                                    }
+                                });
+
+                                self.len.fetch_add(1, Ordering::Relaxed);
+                                return val;
                             }
-                            backoff.spin();
+                            Err(err) => {
+                                new_node = err.new;
+                            }
                         }
                     }
+
+                    if is_adpinv(pred_child.tag()) {
+                        *pred = Shared::null();
+                        *curr = self.head.load(Ordering::Relaxed, epoch::unprotected());
+                        location.reset();
+                    } else if pred_child.with_tag(0x0) != *curr {
+                        *curr = *pred;
+                        location.step_back();
+                    } else {
+                        // Do nothing
+                    }
+
+                    let desc = mem::replace(&mut new_node.pending, Atomic::null())
+                        .load_consume(&epoch::unprotected());
+                    if !desc.is_null() {
+                        drop(desc.to_owned());
+                    }
+                    // backoff.spin();
                 }
             }
         }
@@ -476,10 +500,10 @@ impl<'g, T, const BASE: usize, const DIM: usize> MdList<T, BASE, DIM> {
     pub fn contains(&self, key: usize, guard: &'g Guard) -> bool {
         let coord = Self::key_to_coord(key);
         let pred = &mut Shared::null();
-        let ad = &mut Shared::null();
         let curr = &mut self.head.load(Ordering::Relaxed, guard);
 
-        let location = unsafe { Self::locate_pred(&coord, ad, pred, curr, guard) };
+        let location = unsafe { Self::locate_pred(&coord, Location::default(), pred, curr, guard) };
+
         location.exists()
     }
 
@@ -494,13 +518,11 @@ impl<'g, T, const BASE: usize, const DIM: usize> MdList<T, BASE, DIM> {
 
     unsafe fn locate_pred<'t>(
         coord: &[u8; DIM],
-        ad: &mut Shared<'t, MdDesc<T, BASE, DIM>>,
+        mut location: Location<DIM>,
         pred: &mut Shared<'t, MdNode<T, BASE, DIM>>,
         curr: &mut Shared<'t, MdNode<T, BASE, DIM>>,
         guard: &'t Guard,
     ) -> Location<DIM> {
-        let mut location = Location::default();
-
         while location.cd < DIM {
             while !curr.is_null()
                 && location.current_coord(coord) > location.current_coord(&curr.deref().coord)
@@ -509,9 +531,14 @@ impl<'g, T, const BASE: usize, const DIM: usize> MdList<T, BASE, DIM> {
                 *pred = *curr;
 
                 let curr_ref = curr.deref();
-                *ad = curr_ref.pending.load(Ordering::Relaxed, guard);
-                if !ad.is_null() && ad.deref().location.curr_selection_contains(location.pd) {
-                    Self::finish_inserting(curr_ref, *ad, guard);
+                let pending = curr_ref.pending.load(Ordering::Relaxed, guard);
+                if !pending.is_null()
+                    && pending
+                        .deref()
+                        .location
+                        .curr_selection_contains(location.pd)
+                {
+                    Self::finish_inserting(curr_ref, pending, guard);
                 }
 
                 let child = curr_ref
@@ -538,17 +565,16 @@ impl<'g, T, const BASE: usize, const DIM: usize> MdList<T, BASE, DIM> {
         curr: Shared<'a, MdNode<T, BASE, DIM>>,
         location: &mut Location<DIM>,
         guard: &'a Guard,
-    ) -> Shared<'a, MdDesc<T, BASE, DIM>> {
+    ) {
         let desc = if location.is_conflict() {
-            Shared::null()
+            None
         } else {
             let curr_untagged = Atomic::null();
             curr_untagged.store(curr.with_tag(clr_delinv(curr.tag())), Ordering::Relaxed);
-            Owned::new(MdDesc {
+            Some(Owned::new(MdDesc {
                 curr: curr_untagged,
                 location: *location,
-            })
-            .into_shared(guard)
+            }))
         };
 
         for i in 0..location.pd {
@@ -573,9 +599,11 @@ impl<'g, T, const BASE: usize, const DIM: usize> MdList<T, BASE, DIM> {
             }
         }
 
-        new_node.pending.store(desc, Ordering::Relaxed);
-
-        desc
+        if let Some(desc) = desc {
+            new_node.pending.store(desc, Ordering::Relaxed);
+        } else {
+            new_node.pending.store(Shared::null(), Ordering::Relaxed);
+        }
     }
 
     unsafe fn finish_inserting(
@@ -587,21 +615,17 @@ impl<'g, T, const BASE: usize, const DIM: usize> MdList<T, BASE, DIM> {
         let location = desc_ref.location;
         let curr = &desc_ref.curr;
 
-        for i in location.prev_selection() {
-            let child = &curr
-                .load(Ordering::SeqCst, guard)
-                .as_ref()
-                .unwrap()
-                .children
-                .get_unchecked(i);
+        let curr_ref = &curr.load(Ordering::SeqCst, guard).as_ref().unwrap();
 
+        for i in location.prev_selection() {
+            let child = curr_ref.children.get_unchecked(i);
             let child = child.fetch_or(0x1, Ordering::Relaxed, guard);
             let child = child.with_tag(clr_adpinv(child.tag()));
 
             if !child.is_null()
                 && n.children
                     .get_unchecked(i)
-                    .load(Ordering::Relaxed, guard)
+                    .load(Ordering::SeqCst, guard)
                     .is_null()
             {
                 let _ = n.children.get_unchecked(i).compare_exchange_weak(
@@ -615,15 +639,18 @@ impl<'g, T, const BASE: usize, const DIM: usize> MdList<T, BASE, DIM> {
         }
 
         if n.pending.load(Ordering::Relaxed, guard) == desc {
-            if let Ok(p) = n.pending.compare_exchange_weak(
-                desc,
-                Shared::null(),
-                Ordering::SeqCst,
-                Ordering::Relaxed,
-                guard,
-            ) {
-                if !p.is_null() {
-                    drop(p.into_owned());
+            if n.pending
+                .compare_exchange_weak(
+                    desc,
+                    Shared::null(),
+                    Ordering::SeqCst,
+                    Ordering::Relaxed,
+                    guard,
+                )
+                .is_ok()
+            {
+                if !desc.is_null() {
+                    drop(desc.into_owned());
                 }
             }
         }
@@ -651,36 +678,17 @@ impl<T: std::fmt::Debug, const BASE: usize, const DIM: usize> std::fmt::Debug
 impl<T, const BASE: usize, const DIM: usize> std::ops::Drop for MdList<T, BASE, DIM> {
     fn drop(&mut self) {
         unsafe {
-            let head = self
-                .head
-                .load(Ordering::Relaxed, epoch::unprotected())
-                .deref_mut();
-
-            if !head
-                .pending
-                .load(Ordering::Relaxed, epoch::unprotected())
-                .is_null()
-            {
-                drop(mem::replace(&mut head.pending, Atomic::null()).into_owned());
-            }
-
-            let children = mem::replace(&mut head.children, [(); DIM].map(|_| Atomic::null()));
-
-            drop(mem::replace(&mut self.head, Atomic::null()).into_owned());
-
-            for child in children {
-                let child_ref = child.load(Ordering::Relaxed, epoch::unprotected());
-                if !child_ref.is_null() {
-                    let mut child = child.into_owned();
-                    child.unsafe_drop();
-                }
-            }
+            mem::replace(&mut self.head, Atomic::null())
+                .into_owned()
+                .unsafe_drop();
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use rayon::prelude::*;
+
     use super::*;
 
     #[test]
@@ -733,5 +741,21 @@ mod tests {
         list.insert(1, 2);
         assert_eq!(r.as_deref(), Some(&1));
         assert_eq!(list.get(1).as_deref(), Some(&2));
+    }
+
+    #[test]
+    fn test_parallel() {
+        let map = MdList::<usize, 16, 16>::default();
+        let md_ref = &map;
+
+        (1..1_00).into_par_iter().for_each(|i| {
+            assert!(matches!(md_ref.insert(i, i), None));
+        });
+
+        (1..1_00).into_par_iter().for_each(|i| {
+            assert!(md_ref.contains(i, &epoch::pin()), "key: {}", i);
+            let got = md_ref.get(i).map(|v| *v);
+            assert_eq!(got, Some(i), "key: {}, got: {:?}", i, got);
+        });
     }
 }

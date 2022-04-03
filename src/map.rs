@@ -175,11 +175,11 @@ mod tests {
     fn test_parallel() {
         let map = MdMap::default();
         let md_ref = &map;
-        (1..100_000).into_par_iter().for_each(|i| {
+        (1..10_000).into_par_iter().for_each(|i| {
             assert!(matches!(md_ref.insert(i, i), None));
         });
 
-        (1..100_000).into_par_iter().for_each(|i| {
+        (1..10_000).into_par_iter().for_each(|i| {
             assert!(md_ref.contains_key(&i), "key: {}", i);
             let got = md_ref.get(&i).map(|v| *v);
             assert_eq!(got, Some(i), "key: {}, got: {:?}", i, got);

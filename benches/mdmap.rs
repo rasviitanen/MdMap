@@ -14,10 +14,10 @@ enum Instruction {
 }
 
 pub fn small_key_space(c: &mut Criterion) {
-    let insert_percentage = 70;
+    let insert_percentage = 2;
     let grow_range = 0..1_000;
     let operate_on_keys = [672, 123, 493, 192, 12, 803, 366, 44, 982, 500];
-    let n_ops = 100;
+    let n_ops = 10_000;
     let mut iter = 0;
     let dists = [
         (
