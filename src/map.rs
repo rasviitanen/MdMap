@@ -5,7 +5,7 @@ use std::{borrow::Borrow, collections::hash_map::RandomState};
 
 #[derive(Debug)]
 pub struct MdMap<K, V, const BASE: usize, const DIM: usize, S = RandomState> {
-    list: MdList<V, BASE, DIM>,
+    pub(crate) list: MdList<V, BASE, DIM>,
     hasher: S,
     phantom_data: std::marker::PhantomData<K>,
 }

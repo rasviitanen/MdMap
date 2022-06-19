@@ -1,5 +1,5 @@
 use crossbeam_epoch::{self as epoch, Atomic, CompareExchangeError, Guard, Owned, Shared};
-use crossbeam_utils::{Backoff, CachePadded};
+use crossbeam_utils::CachePadded;
 use std::{
     borrow::BorrowMut,
     mem::{self, MaybeUninit},
@@ -113,16 +113,16 @@ impl<'t: 'g, 'g, T: 't, const BASE: usize, const DIM: usize> Iterator
     }
 }
 
-#[derive(Debug)]
-struct MdDesc<T, const BASE: usize, const DIM: usize> {
+#[derive(Debug, Clone)]
+pub(crate) struct MdDesc<T, const BASE: usize, const DIM: usize> {
     location: Location<DIM>,
-    curr: Atomic<MdNode<T, BASE, DIM>>,
+    pub(crate) curr: Atomic<MdNode<T, BASE, DIM>>,
 }
 
-struct MdNode<T, const BASE: usize, const DIM: usize> {
+pub struct MdNode<T, const BASE: usize, const DIM: usize> {
     pub coord: [u8; DIM],
     val: MaybeUninit<T>,
-    pending: Atomic<MdDesc<T, BASE, DIM>>,
+    pub(crate) pending: Atomic<MdDesc<T, BASE, DIM>>,
     children: [Atomic<Self>; DIM],
 }
 
@@ -288,6 +288,158 @@ impl<const DIM: usize> Location<DIM> {
     }
 }
 
+pub enum Entry<'a, T, const BASE: usize, const DIM: usize> {
+    Occupied(OccupiedEntry<'a, T, BASE, DIM>),
+    Vacant(VacantEntry<'a, T, BASE, DIM>),
+}
+
+pub struct EntryPosition<'a, T, const BASE: usize, const DIM: usize> {
+    coord: [u8; DIM],
+    guard: &'a Guard,
+    head: &'a Atomic<MdNode<T, BASE, DIM>>,
+    location: Location<DIM>,
+    pred: Shared<'a, MdNode<T, BASE, DIM>>,
+    curr: Shared<'a, MdNode<T, BASE, DIM>>,
+}
+
+impl<'a, T, const BASE: usize, const DIM: usize> EntryPosition<'a, T, BASE, DIM> {
+    fn insert(&mut self, val: T, mut is_update: bool) {
+        unsafe {
+            let mut new_node = Owned::new(MdNode::with_coord(self.coord, val));
+            let mut location = self.location;
+
+            loop {
+                if let Some(pred_ref) = self.pred.as_ref() {
+                    let pred_child = pred_ref
+                        .children
+                        .get_unchecked(location.pd)
+                        .load(Ordering::Acquire, &self.guard);
+                    let mut expected = self.curr;
+
+                    if is_delinv(pred_child.tag()) {
+                        expected = self.curr.with_tag(set_delinv(self.curr.tag()));
+                        location.try_bump_to_max();
+                    }
+
+                    if pred_child == expected.into() {
+                        MdList::fill_new_node(
+                            new_node.borrow_mut(),
+                            expected,
+                            &mut location,
+                            &self.guard,
+                        );
+
+                        match pred_ref
+                            .children
+                            .get_unchecked(location.pd)
+                            .compare_exchange_weak(
+                                expected,
+                                new_node,
+                                Ordering::SeqCst,
+                                Ordering::Relaxed,
+                                &self.guard,
+                            ) {
+                            Ok(mut new_node) => {
+                                let desc = new_node
+                                    .deref()
+                                    .pending
+                                    .load(Ordering::Relaxed, &self.guard);
+                                if !desc.is_null() {
+                                    if let Some(curr_ref) = self.curr.as_ref() {
+                                        let pending =
+                                            curr_ref.pending.load(Ordering::Relaxed, &self.guard);
+                                        if !pending.is_null() {
+                                            MdList::finish_inserting(
+                                                curr_ref,
+                                                pending,
+                                                &self.guard,
+                                            );
+                                        }
+                                    }
+
+                                    MdList::finish_inserting(
+                                        new_node.deref_mut(),
+                                        desc,
+                                        &self.guard,
+                                    );
+                                }
+
+                                if is_update {
+                                    let raw = expected.as_raw();
+                                    self.guard.defer_unchecked(move || {
+                                        let mut node =
+                                            Owned::from_raw(raw as *mut MdNode<T, BASE, DIM>);
+                                        node.unsafe_drop_value();
+                                    });
+                                }
+
+                                return;
+                            }
+                            Err(err) => {
+                                new_node = err.new;
+                            }
+                        }
+                    }
+
+                    if is_adpinv(pred_child.tag()) {
+                        self.pred = Shared::null();
+                        self.curr = self.head.load(Ordering::Relaxed, epoch::unprotected());
+                        location.reset();
+                    } else if pred_child.with_tag(0x0) != self.curr {
+                        self.curr = self.pred;
+                        location.step_back();
+                    } else {
+                        // Do nothing
+                    }
+
+                    let desc = mem::replace(&mut new_node.pending, Atomic::null())
+                        .load_consume(&epoch::unprotected());
+                    if !desc.is_null() {
+                        drop(desc.to_owned());
+                    }
+                }
+
+                let found_location = MdList::locate_pred(
+                    &self.coord,
+                    location,
+                    &mut self.pred,
+                    &mut self.curr,
+                    self.guard,
+                );
+                location = found_location;
+                is_update = location.exists() && !is_delinv(self.curr.tag());
+            }
+        }
+    }
+}
+
+pub struct VacantEntry<'a, T, const BASE: usize, const DIM: usize>(EntryPosition<'a, T, BASE, DIM>);
+
+impl<'a, T, const BASE: usize, const DIM: usize> VacantEntry<'a, T, BASE, DIM> {
+    fn insert(mut self, value: T) {
+        self.0.insert(value, false)
+    }
+}
+
+pub struct OccupiedEntry<'a, T, const BASE: usize, const DIM: usize>(
+    EntryPosition<'a, T, BASE, DIM>,
+);
+
+impl<'a, T, const BASE: usize, const DIM: usize> OccupiedEntry<'a, T, BASE, DIM> {
+    fn get(&self) -> Ref<'_, T> {
+        unsafe {
+            let curr_ref = self.0.curr.deref();
+            Ref {
+                val: curr_ref.val.assume_init_ref(),
+            }
+        }
+    }
+
+    fn insert(mut self, value: T) {
+        self.0.insert(value, true)
+    }
+}
+
 pub struct MdList<T, const BASE: usize, const DIM: usize> {
     head: Atomic<MdNode<T, BASE, DIM>>,
     len: CachePadded<AtomicUsize>,
@@ -307,6 +459,10 @@ impl<'g, T, const BASE: usize, const DIM: usize> MdList<T, BASE, DIM> {
             head,
             len: Default::default(),
         }
+    }
+
+    pub fn head(&self) -> &Atomic<MdNode<T, BASE, DIM>> {
+        &self.head
     }
 
     pub fn is_empty(&self) -> bool {
@@ -396,6 +552,36 @@ impl<'g, T, const BASE: usize, const DIM: usize> MdList<T, BASE, DIM> {
                         return None;
                     }
                 }
+            }
+        }
+    }
+
+    pub fn entry(&self, key: usize) -> Entry<'_, T, BASE, DIM> {
+        unsafe {
+            let guard = &*(&epoch::pin() as *const _);
+            let coord = Self::key_to_coord(key);
+            // let backoff = Backoff::new();
+            let mut location = Location::default();
+            let mut curr = self.head.load(Ordering::Relaxed, epoch::unprotected());
+            let mut pred: Shared<'_, MdNode<T, BASE, DIM>> = Shared::null();
+
+            let found_location = Self::locate_pred(&coord, location, &mut pred, &mut curr, guard);
+            location = found_location;
+            let occupied = location.exists() && !is_delinv(curr.tag());
+
+            let entry_pos = EntryPosition {
+                coord,
+                guard,
+                head: &self.head,
+                location: found_location,
+                curr,
+                pred,
+            };
+
+            if occupied {
+                Entry::Occupied(OccupiedEntry(entry_pos))
+            } else {
+                Entry::Vacant(VacantEntry(entry_pos))
             }
         }
     }
@@ -711,10 +897,20 @@ mod tests {
 
     #[test]
     fn test_insert() {
-        let list = MdList::<usize, 16, 16>::new();
-        assert_eq!(list.insert(1, 1).as_deref(), None);
-        assert_eq!(list.insert(1, 2).as_deref(), Some(&1));
-        assert_eq!(list.insert(1, 3).as_deref(), Some(&2));
+        loom::model(|| {
+            let list1 = std::sync::Arc::new(MdList::<usize, 16, 16>::new());
+            let list2 = list1.clone();
+
+            // use 5 since it's greater than the 4 used for the sanitize feature
+            let jh = loom::thread::spawn(move || {
+                assert_eq!(list1.insert(1, 1).as_deref(), None);
+                assert_eq!(list1.insert(1, 2).as_deref(), Some(&1));
+                assert_eq!(list1.insert(1, 3).as_deref(), Some(&2));
+            });
+
+            jh.join().unwrap();
+            assert_eq!(list2.get(1).as_deref(), Some(&3));
+        });
     }
 
     #[test]
@@ -724,6 +920,24 @@ mod tests {
         let v = list.insert(1, 2);
         assert_eq!(list.insert(1, 3).as_deref(), Some(&2));
         assert_eq!(v.as_deref(), Some(&1));
+    }
+
+    #[test]
+    fn test_entry() {
+        let list = MdList::<usize, 16, 16>::new();
+        match list.entry(1) {
+            Entry::Occupied(_) => panic!(),
+            Entry::Vacant(e) => e.insert(123),
+        }
+        assert_eq!(list.get(1).as_deref(), Some(&123));
+        match list.entry(1) {
+            Entry::Occupied(e) => {
+                assert_eq!(*e.get(), 123);
+                e.insert(456);
+            }
+            Entry::Vacant(_) => panic!(),
+        }
+        assert_eq!(list.get(1).as_deref(), Some(&456))
     }
 
     #[test]

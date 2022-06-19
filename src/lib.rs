@@ -8,6 +8,7 @@
 //! while allowing many threads to operate on the list in parallel.
 //! An effect of the multi-dimensional list is that keys are sorted,
 //! which makes this suitable for things like priority queues.
+// mod graph;
 mod list;
 mod map;
 
