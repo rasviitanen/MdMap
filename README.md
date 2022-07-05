@@ -10,9 +10,10 @@
 
 </div>
 
-Items in MdMap are stored in a multi-dimensional linked list.
+Items in `MdMap` are stored in a multi-dimensional linked list.
 This makes it possible to achieve logarithmic search performance while allowing many threads to operate on the list in parallel.
 An effect of the multi-dimensional list is that keys are sorted, which makes this suitable for things like priority queues.
+Together with LFTT, this can handle atomic transactions in a lock-free way as well, which makes this a suitable data structure to represent graphs as well.
 
 ## Performance
 
@@ -22,8 +23,8 @@ Doing this on a few keys, such as with an exponential key distribution can lead 
 Skiplists is another alternative commonly used for concurrent data structures, however concurrency in
 these can be limited under write-heavy loads.
 
-MdMap uses multi-dimensional linked lists (which makes it more of a `MdTreeMap` perhaps) where scalar keys
-acts as coordinates into the underlying structure. This has a couple of befits over other approaches, where MdMap doesn't require
+`MdMap` uses multi-dimensional linked lists (which makes it more of a `MdTreeMap` perhaps) where scalar keys
+acts as coordinates into the underlying structure. This has a couple of befits over other approaches, where `MdMap` doesn't require
 balancing (seen in e.g. BSTs), randomization (e.g. skiplists) nor mutex-based locks (e.g. shard based).
 This makes it quite fast under some loads compared to other solutions.
 
@@ -109,7 +110,7 @@ key distribution summary:
 - Does not yet support the value `0` as the key, which is reserved for the head
 - Check for memory leaks (some leaks are known)
 - Figure out a better hashing situation
-- Test
+- Test (loom)
 
 ## Based on these papers
 
