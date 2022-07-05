@@ -403,7 +403,7 @@ impl<'g, T, const BASE: usize, const DIM: usize> MdList<T, BASE, DIM> {
         unsafe {
             let guard = &epoch::pin();
             let coord = Self::key_to_coord(key);
-            // let backoff = Backoff::new();
+            let backoff = Backoff::new();
             let mut new_node = Owned::new(MdNode::with_coord(coord, val));
             let mut location = Location::default();
             let curr = &mut self.head.load(Ordering::Relaxed, epoch::unprotected());
@@ -491,7 +491,7 @@ impl<'g, T, const BASE: usize, const DIM: usize> MdList<T, BASE, DIM> {
                     if !desc.is_null() {
                         drop(desc.to_owned());
                     }
-                    // backoff.spin();
+                    backoff.spin();
                 }
             }
         }
