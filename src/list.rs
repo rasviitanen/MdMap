@@ -412,7 +412,7 @@ impl<'g, T, const BASE: usize, const DIM: usize> MdList<T, BASE, DIM> {
             loop {
                 let found_location = Self::locate_pred(&coord, location, pred, curr, guard);
                 location = found_location;
-                let is_update = location.exists() && !is_delinv(curr.tag());
+                let is_update = location.exists() && !is_invalid(curr.tag());
 
                 if let Some(pred_ref) = pred.as_ref() {
                     let pred_child = pred_ref
@@ -482,7 +482,6 @@ impl<'g, T, const BASE: usize, const DIM: usize> MdList<T, BASE, DIM> {
                     } else if pred_child.with_tag(0x0) != *curr {
                         *curr = *pred;
                         location.step_back();
-                    } else {
                         // Do nothing
                     }
 
@@ -649,9 +648,11 @@ impl<'g, T, const BASE: usize, const DIM: usize> MdList<T, BASE, DIM> {
                 )
                 .is_ok()
             {
-                if !desc.is_null() {
-                    drop(desc.into_owned());
-                }
+                // if !desc.is_null() {
+                //     guard.defer_unchecked(move || {
+                //         drop(desc.into_owned());
+                //     });
+                // }
             }
         }
     }

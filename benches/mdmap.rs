@@ -14,16 +14,20 @@ enum Instruction {
 }
 
 pub fn small_key_space(c: &mut Criterion) {
-    let insert_percentage = 2;
-    let grow_range = 0..1_000;
-    let operate_on_keys = [672, 123, 493, 192, 12, 803, 366, 44, 982, 500];
-    let n_ops = 10_000;
+    let insert_percentage = 10;
+    let grow_range = 0..1000;
+    let mut num = 0usize;
+    let operate_on_keys = [0; 10].map(|_| {
+        num = num.wrapping_mul(17).wrapping_add(255);
+        num
+    });
+    let n_ops = 3000;
     let mut iter = 0;
     let dists = [
         (
             "exponential",
             operate_on_keys.map(|_| {
-                let r = std::f32::consts::E.powf(iter as f32);
+                let r = std::f32::consts::E.powf(iter as f32 * 0.72);
                 iter += 1;
                 r as usize
             }),
@@ -46,22 +50,22 @@ pub fn small_key_space(c: &mut Criterion) {
         println!("executing: {} ops", n_ops);
         println!("key distribution: `{name}`");
         println!("key distribution summary:");
-        println!("---------------------------------");
-        println!("| key |    ops     | percentage |");
-        println!("=================================");
+        println!("------------------------------------------------------");
+        println!("|            key           |    ops     | percentage |");
+        println!("======================================================");
         let total_weight = weights.iter().sum::<usize>();
         operate_on_keys
             .iter()
             .zip(weights.iter())
             .for_each(|(key, weight)| {
                 println!(
-                    "| {:>3} | ~{:>5} ops |   {:>7.4}% |",
+                    "| {:>24} | ~{:>5} ops |   {:>7.4}% |",
                     key,
                     ((*weight as f64 / total_weight as f64) * n_ops as f64) as usize,
                     (*weight as f64 / total_weight as f64) * 100.0,
                 );
             });
-        println!("--------------------------------\n");
+        println!("-----------------------------------------------------\n");
 
         let mut rng = thread_rng();
         let dist = WeightedIndex::new(weights).unwrap();
