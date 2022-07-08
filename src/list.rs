@@ -181,7 +181,8 @@ impl<T, const BASE: usize, const DIM: usize> MdNode<T, BASE, DIM> {
             ptr::drop_in_place(self.val.as_mut_ptr());
 
             let pending = mem::replace(&mut self.pending, Atomic::null());
-            if !self.pending.load_consume(epoch::unprotected()).is_null() {
+            let pending = self.pending.load_consume(epoch::unprotected());
+            if !pending.is_null() && !is_adpinv(pending.tag()) {
                 pending.into_owned();
             }
 
