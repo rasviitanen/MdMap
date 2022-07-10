@@ -14,20 +14,22 @@ enum Instruction {
 }
 
 pub fn small_key_space(c: &mut Criterion) {
-    let insert_percentage = 10;
-    let grow_range = 0..1000;
-    let mut num = 0usize;
-    let operate_on_keys = [0; 10].map(|_| {
+    let mut rng = thread_rng();
+    let insert_percentage = 98;
+    let grow_range = 0..500;
+    let mut num = usize::MAX / 2;
+    let mut operate_on_keys = [0; 20].map(|_| {
         num = num.wrapping_mul(17).wrapping_add(255);
         num
     });
-    let n_ops = 3000;
+    operate_on_keys.shuffle(&mut rng);
+    let n_ops = 5_000;
     let mut iter = 0;
     let dists = [
         (
             "exponential",
             operate_on_keys.map(|_| {
-                let r = std::f32::consts::E.powf(iter as f32 * 0.72);
+                let r = std::f32::consts::E.powf(iter as f32 * 0.72 * 0.5);
                 iter += 1;
                 r as usize
             }),
@@ -81,11 +83,32 @@ pub fn small_key_space(c: &mut Criterion) {
             })
             .collect::<Vec<_>>();
 
-        let collection = MdMap::default();
+        let collection = MdMap::<_, _, 16, 16>::new();
         for i in grow_range.clone() {
             collection.insert(i, i);
         }
         group.bench_function("MdMap", |b| {
+            b.iter(|| {
+                key_range
+                    .par_iter()
+                    .copied()
+                    .for_each(|instruction| match instruction {
+                        Instruction::Insert(k, v) => {
+                            collection.insert(black_box(k), v);
+                        }
+                        Instruction::Get(k) => {
+                            collection.get(black_box(&k));
+                        }
+                    });
+            })
+        });
+        drop(collection);
+
+        let collection = crossbeam_skiplist::SkipMap::new();
+        for i in grow_range.clone() {
+            collection.insert(i, i);
+        }
+        group.bench_function("SkipMap", |b| {
             b.iter(|| {
                 key_range
                     .par_iter()

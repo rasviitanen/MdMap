@@ -181,7 +181,7 @@ impl<T, const BASE: usize, const DIM: usize> MdNode<T, BASE, DIM> {
             ptr::drop_in_place(self.val.as_mut_ptr());
 
             let pending = mem::replace(&mut self.pending, Atomic::null());
-            let pending = self.pending.load_consume(epoch::unprotected());
+            let pending = pending.load_consume(epoch::unprotected());
             if !pending.is_null() && !is_adpinv(pending.tag()) {
                 pending.into_owned();
             }
@@ -415,32 +415,43 @@ impl<'g, T, const BASE: usize, const DIM: usize> MdList<T, BASE, DIM> {
                 location = found_location;
                 let is_update = location.exists() && !is_invalid(curr.tag());
 
+                if is_update {
+                    // FXIME:(rasviitanen) update value here
+                    return None;
+                }
+
                 if let Some(pred_ref) = pred.as_ref() {
                     let pred_child = pred_ref
                         .children
                         .get_unchecked(location.pd)
                         .load(Ordering::Acquire, guard);
-                    let mut expected = *curr;
+                    let mut to_be_replaced = *curr;
 
                     if is_delinv(pred_child.tag()) {
-                        expected = curr.with_tag(set_delinv(curr.tag()));
+                        to_be_replaced = curr.with_tag(set_delinv(curr.tag()));
                         location.try_bump_to_max();
                     }
 
-                    if pred_child == expected.into() {
-                        Self::fill_new_node(new_node.borrow_mut(), expected, &mut location, guard);
+                    if pred_child == to_be_replaced.into() {
+                        Self::fill_new_node(
+                            new_node.borrow_mut(),
+                            to_be_replaced,
+                            &mut location,
+                            guard,
+                        );
 
                         match pred_ref
                             .children
                             .get_unchecked(location.pd)
                             .compare_exchange_weak(
-                                expected,
+                                to_be_replaced,
                                 new_node,
                                 Ordering::SeqCst,
                                 Ordering::Relaxed,
                                 guard,
                             ) {
                             Ok(mut new_node) => {
+                                // Inserted new node
                                 let desc = new_node.deref().pending.load(Ordering::Relaxed, guard);
                                 if !desc.is_null() {
                                     if let Some(curr_ref) = curr.as_ref() {
@@ -454,21 +465,8 @@ impl<'g, T, const BASE: usize, const DIM: usize> MdList<T, BASE, DIM> {
                                     Self::finish_inserting(new_node.deref_mut(), desc, guard);
                                 }
 
-                                let val = is_update.then(|| {
-                                    let raw = expected.as_raw();
-                                    guard.defer_unchecked(move || {
-                                        let mut node =
-                                            Owned::from_raw(raw as *mut MdNode<T, BASE, DIM>);
-                                        node.unsafe_drop_value();
-                                    });
-
-                                    Ref {
-                                        val: (*curr.as_raw()).val.assume_init_ref(),
-                                    }
-                                });
-
                                 self.len.fetch_add(1, Ordering::Relaxed);
-                                return val;
+                                return None;
                             }
                             Err(err) => {
                                 new_node = err.new;
@@ -487,9 +485,9 @@ impl<'g, T, const BASE: usize, const DIM: usize> MdList<T, BASE, DIM> {
                     }
 
                     let desc = mem::replace(&mut new_node.pending, Atomic::null())
-                        .load_consume(&epoch::unprotected());
+                        .load_consume(epoch::unprotected());
                     if !desc.is_null() {
-                        drop(desc.to_owned());
+                        desc.to_owned();
                     }
                     backoff.spin();
                 }

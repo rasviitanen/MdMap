@@ -15,6 +15,7 @@ rand = "0.8"
 rayon = "1.5"
 dashmap = "5.0"
 crossbeam-epoch = { version = "0.9", features = ["loom"] }
+crossbeam-skiplist = { git = "https://github.com/crossbeam-rs/crossbeam.git" }
 
 [[bench]]
 name = "mdmap"
