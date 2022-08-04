@@ -1,11 +1,12 @@
 use crate::list::{Iter, MdList, Ref};
 use crossbeam_epoch as epoch;
 use std::hash::{BuildHasher, Hash, Hasher};
+use std::ops::Deref;
 use std::{borrow::Borrow, collections::hash_map::RandomState};
 
 #[derive(Debug)]
 pub struct MdMap<K, V, const BASE: usize, const DIM: usize, S = RandomState> {
-    pub(crate) list: MdList<V, BASE, DIM>,
+    pub(crate) list: MdList<(K, V), BASE, DIM>,
     hasher: S,
     phantom_data: std::marker::PhantomData<K>,
 }
@@ -36,6 +37,37 @@ impl<K: Hash, T, const BASE: usize, const DIM: usize> MdMap<K, T, BASE, DIM> {
     }
 }
 
+pub enum Entry<'a, K, T, const BASE: usize, const DIM: usize> {
+    Occupied(OccupiedEntry<'a, K, T, BASE, DIM>),
+    Vacant(VacantEntry<'a, K, T, BASE, DIM>),
+}
+
+pub struct VacantEntry<'a, K, T, const BASE: usize, const DIM: usize> {
+    key: K,
+    entry: crate::list::VacantEntry<'a, (K, T), BASE, DIM>,
+}
+
+impl<'a, K, T, const BASE: usize, const DIM: usize> VacantEntry<'a, K, T, BASE, DIM> {
+    pub fn insert(mut self, value: T) {
+        self.entry.insert((self.key, value))
+    }
+}
+
+pub struct OccupiedEntry<'a, K, T, const BASE: usize, const DIM: usize> {
+    key: K,
+    entry: crate::list::OccupiedEntry<'a, (K, T), BASE, DIM>,
+}
+
+impl<'a, K, T, const BASE: usize, const DIM: usize> OccupiedEntry<'a, K, T, BASE, DIM> {
+    pub fn get(&self) -> &T {
+        unsafe { &*(&self.entry.get().1 as *const _) }
+    }
+
+    pub fn insert(mut self, value: T) {
+        self.entry.insert((self.key, value))
+    }
+}
+
 impl<K: Hash, T, const BASE: usize, const DIM: usize, S: BuildHasher> MdMap<K, T, BASE, DIM, S> {
     /// Creates an empty [`MdMap`] which will use the given hash builder to hash keys.
     pub fn with_hasher(hasher: S) -> Self {
@@ -44,6 +76,14 @@ impl<K: Hash, T, const BASE: usize, const DIM: usize, S: BuildHasher> MdMap<K, T
             hasher,
             phantom_data: std::marker::PhantomData,
         }
+    }
+
+    pub fn retain(&self, mut f: impl FnMut(&K, &mut T) -> bool) {
+        self.list.retain(|v| f(&v.0, &mut v.1));
+    }
+
+    pub fn clear(&mut self) {
+        self.list = MdList::default();
     }
 
     /// Returns true if the map contains no elements.
@@ -64,7 +104,7 @@ impl<K: Hash, T, const BASE: usize, const DIM: usize, S: BuildHasher> MdMap<K, T
     }
 
     /// An iterator visiting all entries in the map
-    pub fn iter(&'_ self) -> Iter<'_, '_, T, BASE, DIM> {
+    pub fn iter(&'_ self) -> Iter<'_, '_, (K, T), BASE, DIM> {
         unsafe {
             let guard = &epoch::unprotected();
             self.list.iter(guard)
@@ -77,22 +117,33 @@ impl<K: Hash, T, const BASE: usize, const DIM: usize, S: BuildHasher> MdMap<K, T
     ///
     /// If the map did have this key present, the value is updated,
     /// and the old value is returned.
-    pub fn insert(&self, key: K, value: T) -> Option<Ref<'_, T>> {
-        let key = self.hash_usize(&key);
-        self.list.insert(key, value)
+    pub fn insert(&self, key: K, value: T) -> Option<Ref<'_, (K, T)>> {
+        let hash = self.hash_usize(&key);
+        self.list.insert(hash, (key, value))
     }
 
     /// Returns a reference to the value corresponding to the key.
-
+    ///
     /// The key may be any borrowed form of the map’s key type,
     /// but [`Hash`] and [`Eq`] on the borrowed form must match those for the key type.
-    pub fn get<Q>(&self, key: &Q) -> Option<Ref<'_, T>>
+    pub fn get<Q>(&self, key: &Q) -> Option<&T>
     where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
         let key = self.hash_usize(&key);
-        self.list.get(key)
+        unsafe { self.list.get(key).map(|v| &*(&v.1 as *const _)) }
+    }
+
+    /// The key may be any borrowed form of the map’s key type,
+    /// but [`Hash`] and [`Eq`] on the borrowed form must match those for the key type.
+    pub fn entry(&self, key: K) -> Entry<'_, K, T, BASE, DIM> {
+        let hash = self.hash_usize(&key);
+        let entry = self.list.entry(hash);
+        match entry {
+            crate::list::Entry::Occupied(entry) => Entry::Occupied(OccupiedEntry { key, entry }),
+            crate::list::Entry::Vacant(entry) => Entry::Vacant(VacantEntry { key, entry }),
+        }
     }
 
     /// Returns true if the map contains a value for the specified key.
@@ -114,7 +165,7 @@ impl<K: Hash, T, const BASE: usize, const DIM: usize, S: BuildHasher> MdMap<K, T
     ///
     /// The key may be any borrowed form of the map’s key type,
     /// but [`Hash`] and [`Eq`] on the borrowed form must match those for the key type.
-    pub unsafe fn remove<Q>(&self, key: &Q) -> Option<T>
+    pub unsafe fn remove<Q>(&self, key: &Q) -> Option<(K, T)>
     where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
@@ -150,7 +201,7 @@ mod tests {
         let map = MdMap::default();
         map.insert(1, 10);
         assert_eq!(*map.get(&1).unwrap(), 10);
-        assert_eq!(unsafe { map.remove(&1) }, Some(10));
+        assert_eq!(unsafe { map.remove(&1) }, Some((1, 10)));
         let res = map.get(&1);
         assert!(res.is_none(), "got: {:?}", res.map(|v| *v));
     }
@@ -167,7 +218,7 @@ mod tests {
         }
 
         for i in 0..100 {
-            assert_eq!(unsafe { map.remove(&i) }, Some(i), "key: {}", i);
+            assert_eq!(unsafe { map.remove(&i) }, Some((i, i)), "key: {}", i);
         }
     }
 

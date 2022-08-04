@@ -44,7 +44,7 @@ const fn is_invalid(p: usize) -> bool {
 }
 
 pub struct Ref<'g, T> {
-    val: &'g T,
+    pub(crate) val: &'g T,
 }
 
 impl<'g, T> std::ops::Deref for Ref<'g, T> {
@@ -416,7 +416,7 @@ impl<'a, T, const BASE: usize, const DIM: usize> EntryPosition<'a, T, BASE, DIM>
 pub struct VacantEntry<'a, T, const BASE: usize, const DIM: usize>(EntryPosition<'a, T, BASE, DIM>);
 
 impl<'a, T, const BASE: usize, const DIM: usize> VacantEntry<'a, T, BASE, DIM> {
-    fn insert(mut self, value: T) {
+    pub fn insert(mut self, value: T) {
         self.0.insert(value, false)
     }
 }
@@ -426,7 +426,7 @@ pub struct OccupiedEntry<'a, T, const BASE: usize, const DIM: usize>(
 );
 
 impl<'a, T, const BASE: usize, const DIM: usize> OccupiedEntry<'a, T, BASE, DIM> {
-    fn get(&self) -> Ref<'_, T> {
+    pub fn get(&self) -> Ref<'_, T> {
         unsafe {
             let curr_ref = self.0.curr.deref();
             Ref {
@@ -435,7 +435,7 @@ impl<'a, T, const BASE: usize, const DIM: usize> OccupiedEntry<'a, T, BASE, DIM>
         }
     }
 
-    fn insert(mut self, value: T) {
+    pub fn insert(mut self, value: T) {
         self.0.insert(value, true)
     }
 }
@@ -458,6 +458,44 @@ impl<'g, T, const BASE: usize, const DIM: usize> MdList<T, BASE, DIM> {
         Self {
             head,
             len: Default::default(),
+        }
+    }
+
+    pub fn retain(&self, mut f: impl FnMut(&mut T) -> bool) {
+        let guard = &epoch::pin();
+        let mut stack = vec![&self.head];
+        unsafe {
+            while let Some(n) = stack.pop() {
+                let mut node = n.load(Ordering::SeqCst, guard);
+                if node.is_null() || is_delinv(node.tag()) {
+                    continue;
+                }
+
+                let node_ref = node.as_ref().unwrap();
+
+                // Skip the root node
+                // FIXME: we should mark this node
+                // and include it if set
+                if node_ref.coord != [0; DIM] {
+                    if !f(node.deref_mut().val.assume_init_mut()) {
+                        let marked = node.with_tag(set_delinv(node.tag()));
+                        let _ = n.compare_exchange_weak(
+                            node,
+                            marked,
+                            Ordering::SeqCst,
+                            Ordering::Relaxed,
+                            guard,
+                        );
+                    }
+                }
+
+                for d in 0..DIM {
+                    let child = &node_ref.children.get_unchecked(d);
+                    if !child.load(Ordering::SeqCst, guard).is_null() {
+                        stack.push(child);
+                    }
+                }
+            }
         }
     }
 
@@ -938,6 +976,20 @@ mod tests {
             Entry::Vacant(_) => panic!(),
         }
         assert_eq!(list.get(1).as_deref(), Some(&456))
+    }
+
+    #[test]
+    fn test_retain() {
+        let list = MdList::<usize, 16, 16>::new();
+        list.insert(1, 1);
+        list.insert(2, 2);
+        list.insert(3, 3);
+        list.insert(4, 4);
+        list.retain(|v| *v % 2 == 0);
+        assert_eq!(list.get(1).as_deref(), None);
+        assert_eq!(list.get(2).as_deref(), Some(&2));
+        assert_eq!(list.get(3).as_deref(), None);
+        assert_eq!(list.get(4).as_deref(), Some(&4));
     }
 
     #[test]
