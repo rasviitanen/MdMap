@@ -1,7 +1,6 @@
 use crate::list::{Iter, MdList, Ref};
 use crossbeam_epoch as epoch;
 use std::hash::{BuildHasher, Hash, Hasher};
-use std::ops::Deref;
 use std::{borrow::Borrow, collections::hash_map::RandomState};
 
 #[derive(Debug)]
@@ -48,7 +47,7 @@ pub struct VacantEntry<'a, K, T, const BASE: usize, const DIM: usize> {
 }
 
 impl<'a, K, T, const BASE: usize, const DIM: usize> VacantEntry<'a, K, T, BASE, DIM> {
-    pub fn insert(mut self, value: T) {
+    pub fn insert(self, value: T) {
         self.entry.insert((self.key, value))
     }
 }
@@ -63,8 +62,8 @@ impl<'a, K, T, const BASE: usize, const DIM: usize> OccupiedEntry<'a, K, T, BASE
         unsafe { &*(&self.entry.get().1 as *const _) }
     }
 
-    pub fn insert(mut self, value: T) {
-        self.entry.insert((self.key, value))
+    pub fn insert(self, value: T) {
+        self.entry.insert((self.key, value));
     }
 }
 
@@ -117,7 +116,7 @@ impl<K: Hash, T, const BASE: usize, const DIM: usize, S: BuildHasher> MdMap<K, T
     ///
     /// If the map did have this key present, the value is updated,
     /// and the old value is returned.
-    pub fn insert(&self, key: K, value: T) -> Option<Ref<'_, (K, T)>> {
+    pub fn insert(&self, key: K, value: T) -> Option<(K, T)> {
         let hash = self.hash_usize(&key);
         self.list.insert(hash, (key, value))
     }

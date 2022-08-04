@@ -104,26 +104,26 @@ pub fn small_key_space(c: &mut Criterion) {
         });
         drop(collection);
 
-        let collection = crossbeam_skiplist::SkipMap::new();
-        for i in grow_range.clone() {
-            collection.insert(i, i);
-        }
-        group.bench_function("SkipMap", |b| {
-            b.iter(|| {
-                key_range
-                    .par_iter()
-                    .copied()
-                    .for_each(|instruction| match instruction {
-                        Instruction::Insert(k, v) => {
-                            collection.insert(black_box(k), v);
-                        }
-                        Instruction::Get(k) => {
-                            collection.get(black_box(&k));
-                        }
-                    });
-            })
-        });
-        drop(collection);
+        // let collection = crossbeam_skiplist::SkipMap::new();
+        // for i in grow_range.clone() {
+        //     collection.insert(i, i);
+        // }
+        // group.bench_function("SkipMap", |b| {
+        //     b.iter(|| {
+        //         key_range
+        //             .par_iter()
+        //             .copied()
+        //             .for_each(|instruction| match instruction {
+        //                 Instruction::Insert(k, v) => {
+        //                     collection.insert(black_box(k), v);
+        //                 }
+        //                 Instruction::Get(k) => {
+        //                     collection.get(black_box(&k));
+        //                 }
+        //             });
+        //     })
+        // });
+        // drop(collection);
 
         let collection = DashMap::new();
         for i in grow_range.clone() {
