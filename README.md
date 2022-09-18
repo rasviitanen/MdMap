@@ -12,21 +12,24 @@
 
 Items in `MdMap` are stored in a multi-dimensional linked list.
 This makes it possible to achieve logarithmic search performance while allowing many threads to operate on the list in parallel.
-An effect of the multi-dimensional list is that keys are sorted, which makes this suitable for things like priority queues.
-Together with LFTT, this can handle atomic transactions in a lock-free way as well, which makes this a suitable data structure to represent graphs as well.
+An effect of the multi-dimensional list is that keys have a detirministic order, which makes this suitable for things like priority queues (if using numerical order) or data indexes (if using lexiographical order).
+Together with lock-free transactional theory (LFTT), this can handle atomic transactions in a lock-free way as well, which makes this a suitable data structure to represent graphs.
 
 ## Performance
 
 Other concurrent data structures builds on sharding (e.g. `DashMap`).
 Doing this on a few keys, such as with an exponential key distribution can lead to a lot of lock contention and poor performance.
 
-Skiplists is another alternative commonly used for concurrent data structures, however concurrency in
-these can be limited under write-heavy loads.
+Skiplists is another alternative commonly used for concurrent data structures, however concurrency in these can be limited under write-heavy loads.
 
-`MdMap` uses multi-dimensional linked lists (which makes it more of a `MdTreeMap` perhaps) where scalar keys
-acts as coordinates into the underlying structure. This has a couple of befits over other approaches, where `MdMap` doesn't require
-balancing (seen in e.g. BSTs), randomization (e.g. skiplists) nor mutex-based locks (e.g. shard based).
+`MdMap` uses multi-dimensional linked lists (which makes it more of a `MdTreeMap` perhaps) where scalar keys acts as coordinates into the underlying structure. This has a couple of befits over other approaches, where `MdMap` doesn't require balancing (seen in e.g. BSTs), randomization (e.g. skiplists) nor mutex-based locks (e.g. shard based).
 This makes it quite fast under some loads compared to other solutions.
+
+Comparing to `BTreeMap`
+
+**Quirks**: Implementing the function to convert any key type to a N dimentional coord can be tricky.
+For `u64`, each key can be mapped to a key with 16-dimensions, where each individual dimension has base 16 `16^16 = 2^64`. Any `AsRef<[u8]>` can be mapped to a dimension of `MAX_LEN` and base `2^8`, this can be ineffective if `MAX_LEN` is big, as traversals
+may loop over a total of `MAX_LEN` dimensions.
 
 **Disclaimer**: MdMap is still under development and I am working on improving its performance. It's still pretty
 slow for most workloads, but looks quite promising :)
@@ -112,7 +115,9 @@ key distribution summary:
 - Figure out a better hashing situation
 - Test (loom)
 
-## Based on these papers
+## Based on
 
+- The ebr implementation is taken from [sled](https://github.com/spacejam/sled/), along with inspiration on how to structure
+lock-free data structures.
 - Zachary Painter, Christina Peterson, Damian Dechev. _Lock-Free Transactional Adjacency List._
 - Deli Zhang and Damian Dechev. _An efficient lock-free logarithmic search data structure based on multi-dimensional list._

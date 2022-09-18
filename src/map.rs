@@ -1,4 +1,4 @@
-use crate::list::{Iter, MdList, Ref};
+use crate::list::{Iter, MdList};
 use crossbeam_epoch as epoch;
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::{borrow::Borrow, collections::hash_map::RandomState};

@@ -2,11 +2,11 @@
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use dashmap::DashMap;
-use mdcollections::{MdList, MdMap};
+use mdcollections::mdlist::MdList;
+use mdcollections::MdMap;
 use rand::distributions::WeightedIndex;
 use rand::prelude::*;
 use rayon::prelude::*;
-
 #[derive(Clone, Copy)]
 enum Instruction {
     Insert(usize, usize),
@@ -15,25 +15,25 @@ enum Instruction {
 
 pub fn small_key_space(c: &mut Criterion) {
     let mut rng = thread_rng();
-    let insert_percentage = 98;
-    let grow_range = 0..500;
+    let insert_percentage = 20;
     let mut num = usize::MAX / 2;
-    let mut operate_on_keys = [0; 20].map(|_| {
+    let mut operate_on_keys = [0; 500].map(|_| {
         num = num.wrapping_mul(17).wrapping_add(255);
         num
     });
     operate_on_keys.shuffle(&mut rng);
-    let n_ops = 5_000;
+    let grow_range = operate_on_keys.clone();
+    let n_ops = 1_000;
     let mut iter = 0;
     let dists = [
-        (
-            "exponential",
-            operate_on_keys.map(|_| {
-                let r = std::f32::consts::E.powf(iter as f32 * 0.72 * 0.5);
-                iter += 1;
-                r as usize
-            }),
-        ),
+        // (
+        //     "exponential",
+        //     operate_on_keys.map(|_| {
+        //         let r = std::f32::consts::E.powf(iter as f32 * 0.72 * 0.5);
+        //         iter += 1;
+        //         r as usize
+        //     }),
+        // ),
         ("uniform", operate_on_keys.map(|_| 1)),
     ];
 
@@ -42,7 +42,6 @@ pub fn small_key_space(c: &mut Criterion) {
         println!("starting benchmark...");
         println!("");
         println!("[config]");
-        println!("map size: {} entries (prefilled)", grow_range.end);
         println!(
             "operation distribution: {}% get; {}% insert",
             100 - insert_percentage,
@@ -55,18 +54,18 @@ pub fn small_key_space(c: &mut Criterion) {
         println!("------------------------------------------------------");
         println!("|            key           |    ops     | percentage |");
         println!("======================================================");
-        let total_weight = weights.iter().sum::<usize>();
-        operate_on_keys
-            .iter()
-            .zip(weights.iter())
-            .for_each(|(key, weight)| {
-                println!(
-                    "| {:>24} | ~{:>5} ops |   {:>7.4}% |",
-                    key,
-                    ((*weight as f64 / total_weight as f64) * n_ops as f64) as usize,
-                    (*weight as f64 / total_weight as f64) * 100.0,
-                );
-            });
+        // let total_weight = weights.iter().sum::<usize>();
+        // operate_on_keys
+        //     .iter()
+        //     .zip(weights.iter())
+        //     .for_each(|(key, weight)| {
+        //         println!(
+        //             "| {:>24} | ~{:>5} ops |   {:>7.4}% |",
+        //             key,
+        //             ((*weight as f64 / total_weight as f64) * n_ops as f64) as usize,
+        //             (*weight as f64 / total_weight as f64) * 100.0,
+        //         );
+        //     });
         println!("-----------------------------------------------------\n");
 
         let mut rng = thread_rng();
@@ -83,11 +82,11 @@ pub fn small_key_space(c: &mut Criterion) {
             })
             .collect::<Vec<_>>();
 
-        let collection = MdMap::<_, _, 16, 16>::new();
+        let collection = MdList::<usize, usize>::new();
         for i in grow_range.clone() {
             collection.insert(i, i);
         }
-        group.bench_function("MdMap", |b| {
+        group.bench_function("MdList", |b| {
             b.iter(|| {
                 key_range
                     .par_iter()
@@ -97,33 +96,12 @@ pub fn small_key_space(c: &mut Criterion) {
                             collection.insert(black_box(k), v);
                         }
                         Instruction::Get(k) => {
-                            collection.get(black_box(&k));
+                            collection.get(black_box(k));
                         }
                     });
             })
         });
         drop(collection);
-
-        // let collection = crossbeam_skiplist::SkipMap::new();
-        // for i in grow_range.clone() {
-        //     collection.insert(i, i);
-        // }
-        // group.bench_function("SkipMap", |b| {
-        //     b.iter(|| {
-        //         key_range
-        //             .par_iter()
-        //             .copied()
-        //             .for_each(|instruction| match instruction {
-        //                 Instruction::Insert(k, v) => {
-        //                     collection.insert(black_box(k), v);
-        //                 }
-        //                 Instruction::Get(k) => {
-        //                     collection.get(black_box(&k));
-        //                 }
-        //             });
-        //     })
-        // });
-        // drop(collection);
 
         let collection = DashMap::new();
         for i in grow_range.clone() {

@@ -918,6 +918,7 @@ mod tests {
     fn test_get() {
         let list = MdList::<usize, 16, 16>::new();
         list.insert(1, 1);
+        println!("get");
         assert_eq!(list.get(1).as_deref(), Some(&1));
     }
 
@@ -925,7 +926,7 @@ mod tests {
     fn test_get_hold_ref() {
         let list = MdList::<usize, 16, 16>::new();
         list.insert(1, 1);
-        let r = list.get(1);
+        let _r = list.get(1);
         list.insert(1, 2);
         // This is unsafe for now :)
         // assert_eq!(r.as_deref(), Some(&1));
