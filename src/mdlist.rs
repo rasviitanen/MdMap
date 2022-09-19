@@ -4,7 +4,7 @@ use std::collections::VecDeque;
 use std::ops::Deref;
 
 use crate::cachepadded::CachePadded;
-use crate::ebr::{pin, Atomic, Guard, Owned, Shared};
+use crate::ebr::{pin, unprotected, Atomic, Guard, Owned, Shared};
 
 #[derive(Debug)]
 pub struct AdoptDesc<const DIM: usize> {
@@ -33,7 +33,8 @@ impl<const DIM: usize> Node<DIM> {
     unsafe fn unsafe_drop(&self, guard: &Guard) {
         let pending = self.adesc.load(Relaxed, guard);
         if !pending.is_null() && !pending.tag() != 0x1 {
-            guard.defer_destroy(pending);
+            pending.into_owned();
+            // guard.defer_destroy(pending);
         }
 
         for child in &self.children {
@@ -57,7 +58,8 @@ impl<const DIM: usize> IsElement<DIM, Node<DIM>> for Node<DIM> {
     }
 
     unsafe fn finalize(entry: &Node<DIM>, guard: &Guard) {
-        guard.defer_destroy(Shared::from(Self::element_of(entry) as *const _));
+        Shared::from(Self::element_of(entry) as *const _).into_owned();
+        // guard.defer_destroy(Shared::from(Self::element_of(entry) as *const _));
     }
 }
 
@@ -285,11 +287,11 @@ impl<const DIM: usize, T, C: IsElement<DIM, T>> List<DIM, T, C> {
         loop {
             let mut p = self.locate_pred(entry.coords, guard);
 
-            // if p.dc == DIM && (p.curr.tag() & Self::DEL == 0) {
-            //     // Node already exists
-            //     C::finalize(entry, guard);
-            //     return;
-            // }
+            if p.dc == DIM && (p.curr.tag() & Self::DEL == 0) {
+                // Node already exists
+                C::finalize(entry, guard);
+                return;
+            }
 
             if let Some(curr) = p.curr.as_ref() {
                 ad = curr.adesc.load(Relaxed, guard);
@@ -309,12 +311,12 @@ impl<const DIM: usize, T, C: IsElement<DIM, T>> List<DIM, T, C> {
             ad = Shared::null();
 
             if p.dp != p.dc {
-                ad = Owned::new(AdoptDesc {
-                    curr: p.curr.into_owned(),
-                    dp: p.dp,
-                    dc: p.dc,
-                })
-                .into_shared(guard);
+                // ad = Owned::new(AdoptDesc {
+                //     curr: p.curr.into_owned(),
+                //     dp: p.dp,
+                //     dc: p.dc,
+                // })
+                // .into_shared(guard);
             }
 
             for i in 0..p.dp {
@@ -368,7 +370,7 @@ impl<const DIM: usize, T, C: IsElement<DIM, T>> List<DIM, T, C> {
 impl<const DIM: usize, T, C: IsElement<DIM, T>> Drop for List<DIM, T, C> {
     fn drop(&mut self) {
         unsafe {
-            let guard = pin();
+            let guard = unprotected();
             self.head.load(Relaxed, &guard).deref().unsafe_drop(&guard);
         }
     }
@@ -390,7 +392,7 @@ impl<const DIM: usize, K: ToCoords<DIM>, T> MdList<K, T, DIM> {
     #[inline]
     pub fn insert(&self, key: K, value: T) {
         unsafe {
-            let guard = crate::ebr::pin();
+            let guard = crate::ebr::unprotected();
             let elem = Owned::new(NodeWithValue::new(key.to_coords(), value)).into_shared(&guard);
             self.list.insert(elem, &guard)
         }

@@ -15,9 +15,9 @@ enum Instruction {
 
 pub fn small_key_space(c: &mut Criterion) {
     let mut rng = thread_rng();
-    let insert_percentage = 20;
+    let insert_percentage = 5;
     let mut num = usize::MAX / 2;
-    let mut operate_on_keys = [0; 500].map(|_| {
+    let mut operate_on_keys = [0; 100].map(|_| {
         num = num.wrapping_mul(17).wrapping_add(255);
         num
     });
